@@ -40,9 +40,10 @@ A phone can't run Android Studio, so Switchboard gives the model four tools and 
 
 The model loops on its own (call a tool, read the result, fix, retry, up to 40 steps), so it can install packages, write a project, build it and install the APK.
 
-**Setup (Settings, then Tools)**
-- *Termux on the phone* (install Termux from F-Droid): save runner.py to Downloads, then run `pkg install -y python && termux-setup-storage`, then `python ~/storage/downloads/runner.py`, and paste the token it prints into the app. URL: `http://127.0.0.1:8765`.
-- *A computer*: run `python3 runner.py --host 0.0.0.0`, then use `http://<computer-ip>:8765` with Unrestricted mode on (plain http on your network). A computer is the most reliable way to build Android projects; in Termux, Gradle needs the `aapt2` package and `android.aapt2FromMavenOverride`.
+**Where tools run (Settings, then Tools, then "Run on")**
+- **This phone** (default, no setup): commands run inside Switchboard with Android's toybox `sh`, and files live in the app's private storage. Android gives apps no package manager or compilers, so this can't build APKs.
+- **Termux** (full Linux on the phone, no computer): Switchboard writes `runner.py` into Termux, installs Python if needed, and starts it through Termux's `RUN_COMMAND` API, either automatically or with "Start runner now". One-time setup: install Termux from F-Droid, run `mkdir -p ~/.termux && echo 'allow-external-apps = true' >> ~/.termux/termux.properties && termux-reload-settings` in Termux, and grant Switchboard the Termux permission. The model is told how to build an APK in Termux without Gradle (aapt2, javac, d8, apksigner).
+- **Computer**: run `python3 runner.py --host 0.0.0.0` and enter its URL and token.
 
 **Safety**
 - Every action shows Approve / Always / Deny first. "Always" lasts for that chat until the app restarts. You can turn approval off in Settings.

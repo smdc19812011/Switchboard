@@ -20,8 +20,24 @@ import java.util.concurrent.TimeUnit
 /** Result handed back to the model. */
 data class ToolResult(val text: String, val isError: Boolean = false)
 
+/** Somewhere tool actions run: the app's own sandbox, or runner.py in Termux / on a computer. */
+interface ToolHost {
+    /** One-line description of the machine for the model, or throws if unreachable. */
+    suspend fun describe(): String
+    suspend fun execute(call: ToolCall): ToolResult
+    /** Copies a file from the host to [dest] on the phone (used by install_apk). */
+    suspend fun fetchFile(path: String, dest: File)
+}
+
 /** Talks to runner.py (Termux or a computer). Holds no state besides the address and token. */
-class Runner(private val baseUrl: String, private val token: String, private val unrestricted: Boolean) {
+class Runner(private val baseUrl: String, private val token: String, private val unrestricted: Boolean) : ToolHost {
+    override suspend fun describe(): String {
+        val i = info()
+        return "${i.str("os")}${if (i.str("termux") == "true") " (Termux)" else ""}, workspace ${i.str("workspace")}"
+    }
+
+    override suspend fun fetchFile(path: String, dest: File) { download(path, dest) }
+
     private val json = Json { ignoreUnknownKeys = true }
     private val jsonType = "application/json".toMediaType()
     private val http = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS).build()
@@ -117,7 +133,7 @@ class Runner(private val baseUrl: String, private val token: String, private val
     }
 
     /** Executes a runner-side tool. [INSTALL_APK] is handled by the caller (needs Android APIs). */
-    suspend fun execute(call: ToolCall): ToolResult {
+    override suspend fun execute(call: ToolCall): ToolResult {
         val a = runCatching { json.parseToJsonElement(call.arguments).jsonObject }.getOrElse { return ToolResult("Arguments were not valid JSON: ${call.arguments}", true) }
         return runCatching {
             when (call.name) {

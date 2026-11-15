@@ -114,6 +114,12 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
                     else -> MessageList(msgs, vm.streaming, vm.pendingApproval, onDecide = vm::decide, onRegenerate = vm::regenerate)
                 }
             }
+            vm.toolStatus?.let {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp); Spacer(Modifier.size(8.dp))
+                    Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
             Composer(enabled = provider != null, streaming = vm.streaming, onSend = vm::send, onStop = vm::stop)
         }
     }

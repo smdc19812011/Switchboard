@@ -62,6 +62,8 @@ import androidx.compose.ui.unit.dp
 import app.switchboard.data.ApiKind
 import app.switchboard.data.Presets
 import app.switchboard.data.Provider
+import app.switchboard.data.RunnerMode
+import app.switchboard.net.Termux
 import java.util.UUID
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -206,59 +208,104 @@ private fun ProviderDialog(initial: Provider, isNew: Boolean, unrestricted: Bool
 }
 
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ToolsSection(vm: ChatViewModel) {
     val s = vm.settings
     val ctx = LocalContext.current
     val clipboard = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
-    val script = remember { ctx.assets.open("runner.py").bufferedReader().use { it.readText() } }
     var status by remember { mutableStateOf<String?>(null) }
-    val save = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/x-python")) { uri ->
-        if (uri != null) status = runCatching { ctx.contentResolver.openOutputStream(uri)!!.use { it.write(script.toByteArray()) }; "Saved runner.py" }
-            .getOrElse { "Couldn't save: ${it.message}" }
-    }
 
     FRow(verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text("Tools: let the model run commands", style = MaterialTheme.typography.titleMedium)
-            Text("The model can install packages, write files, build (for example an APK) and install the result on this phone, through runner.py running in Termux or on a computer.",
+            Text("The model can run commands, write files, build things and install APKs on this phone.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Switch(checked = s.toolsEnabled, onCheckedChange = vm::setToolsEnabled)
     }
     if (!s.toolsEnabled) return
 
-    Text("""
-        Setup in Termux (Termux is installed from F-Droid):
-        1. Save runner.py below to Downloads.
-        2. In Termux: pkg install -y python && termux-setup-storage
-        3. python ~/storage/downloads/runner.py
-        4. Paste the token it prints below. Keep Termux open while you chat.
-        On a computer: python3 runner.py --host 0.0.0.0, then use http://<computer-ip>:8765 (turn on Unrestricted mode for plain http on your network).
-    """.trimIndent(), style = MaterialTheme.typography.bodySmall)
-    FRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        OutlinedButton(onClick = { save.launch("runner.py") }) { Text("Save runner.py") }
-        OutlinedButton(onClick = { clipboard.setText(AnnotatedString(script)); status = "Copied runner.py to the clipboard" }) { Text("Copy") }
+    Text("Run on", style = MaterialTheme.typography.labelMedium)
+    val modes = listOf(RunnerMode.PHONE to "This phone", RunnerMode.TERMUX to "Termux", RunnerMode.REMOTE to "Computer")
+    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+        modes.forEachIndexed { i, (m, label) ->
+            SegmentedButton(selected = s.runnerMode == m, onClick = { vm.setRunnerMode(m); status = null },
+                shape = SegmentedButtonDefaults.itemShape(i, modes.size)) { Text(label) }
+        }
     }
-    var url by remember { mutableStateOf(s.runnerUrl) }
-    var token by remember { mutableStateOf(s.runnerToken) }
-    var showToken by remember { mutableStateOf(false) }
-    OutlinedTextField(url, { url = it; vm.setRunner(it, token) }, label = { Text("Runner URL") }, singleLine = true,
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth())
-    OutlinedTextField(token, { token = it; vm.setRunner(url, it) }, label = { Text("Runner token") }, singleLine = true,
-        visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
-        trailingIcon = { IconButton(onClick = { showToken = !showToken }) {
-            Icon(if (showToken) Icons.Default.VisibilityOff else Icons.Default.Visibility, if (showToken) "Hide token" else "Show token") } },
-        modifier = Modifier.fillMaxWidth())
-    FilledTonalButton(onClick = { status = "Connecting…"; scope.launch { status = vm.testRunner().getOrElse { "Failed: ${it.message}" } } }) { Text("Test connection") }
+
+    when (s.runnerMode) {
+        RunnerMode.PHONE -> Text(
+            "No setup. Commands run inside Switchboard with Android's built-in shell. Android doesn't let apps install packages or compilers, " +
+                "so this handles files and simple commands only. To build APKs on the phone, choose Termux.",
+            style = MaterialTheme.typography.bodySmall)
+
+        RunnerMode.TERMUX -> {
+            val installed = Termux.isInstalled(ctx)
+            var granted by remember { mutableStateOf(Termux.hasPermission(ctx)) }
+            val askPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
+            Text("Full Linux tools on this phone. Switchboard starts the runner in Termux for you. One-time setup:", style = MaterialTheme.typography.bodySmall)
+            SetupStep(1, "Install Termux from F-Droid and open it once.", done = installed)
+            SetupStep(2, "In Termux, run this command (it lets Switchboard start commands there):", done = false)
+            FRow(verticalAlignment = Alignment.CenterVertically) {
+                Text(Termux.ENABLE_EXTERNAL_APPS, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                TextButton(onClick = { clipboard.setText(AnnotatedString(Termux.ENABLE_EXTERNAL_APPS)); status = "Command copied. Paste it in Termux." }) { Text("Copy") }
+            }
+            SetupStep(3, "Allow Switchboard to run commands in Termux.", done = granted)
+            if (!granted) OutlinedButton(enabled = installed, onClick = { askPermission.launch(Termux.PERMISSION) }) { Text("Grant permission") }
+            FilledTonalButton(enabled = installed && granted, onClick = {
+                status = "Starting the runner in Termux… (the first start installs Python and can take a minute)"
+                scope.launch { status = vm.startTermuxRunner().getOrElse { "Failed: ${it.message}" } }
+            }) { Text("Start runner now") }
+            Text("It also starts automatically when the model needs it.", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+
+        RunnerMode.REMOTE -> {
+            val script = remember { ctx.assets.open("runner.py").bufferedReader().use { it.readText() } }
+            val save = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/x-python")) { uri ->
+                if (uri != null) status = runCatching { ctx.contentResolver.openOutputStream(uri)!!.use { it.write(script.toByteArray()) }; "Saved runner.py" }
+                    .getOrElse { "Couldn't save: ${it.message}" }
+            }
+            Text("On the computer, run: python3 runner.py --host 0.0.0.0. Then enter http://<computer-ip>:8765 and the token it prints. " +
+                "Plain http on your network needs Unrestricted mode.", style = MaterialTheme.typography.bodySmall)
+            FRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { save.launch("runner.py") }) { Text("Save runner.py") }
+                OutlinedButton(onClick = { clipboard.setText(AnnotatedString(script)); status = "Copied runner.py to the clipboard" }) { Text("Copy") }
+            }
+            var url by remember { mutableStateOf(s.runnerUrl) }
+            var token by remember { mutableStateOf(s.runnerToken) }
+            var showToken by remember { mutableStateOf(false) }
+            OutlinedTextField(url, { url = it; vm.setRunner(it, token) }, label = { Text("Runner URL") }, singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(token, { token = it; vm.setRunner(url, it) }, label = { Text("Runner token") }, singleLine = true,
+                visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = { IconButton(onClick = { showToken = !showToken }) {
+                    Icon(if (showToken) Icons.Default.VisibilityOff else Icons.Default.Visibility, if (showToken) "Hide token" else "Show token") } },
+                modifier = Modifier.fillMaxWidth())
+        }
+    }
+    if (s.runnerMode != RunnerMode.TERMUX)
+        FilledTonalButton(onClick = { status = "Connecting…"; scope.launch { status = vm.testRunner().getOrElse { "Failed: ${it.message}" } } }) { Text("Test") }
     status?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+
     FRow(verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Text("Ask before each action", style = MaterialTheme.typography.bodyLarge)
-            Text("Recommended. When off, the model runs commands on that machine without asking.",
+            Text(if (s.askBeforeRun) "You approve each command, file write and install." else "Off: the model runs everything without asking.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Switch(checked = s.askBeforeRun, onCheckedChange = vm::setAskBeforeRun)
+    }
+}
+
+@Composable
+private fun SetupStep(n: Int, text: String, done: Boolean) {
+    FRow(verticalAlignment = Alignment.Top) {
+        Text(if (done) "✓" else "$n.", modifier = Modifier.size(width = 24.dp, height = 20.dp),
+            color = if (done) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
+        Text(text, style = MaterialTheme.typography.bodySmall)
     }
 }

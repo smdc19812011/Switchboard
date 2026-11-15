@@ -21,6 +21,11 @@ import app.switchboard.data.ToolCall
 import app.switchboard.net.ChatClient
 import app.switchboard.net.RequestOptions
 import app.switchboard.net.Runner
+import app.switchboard.net.PhoneHost
+import app.switchboard.net.Termux
+import app.switchboard.net.ToolHost
+import app.switchboard.data.RunnerMode
+import kotlinx.coroutines.delay
 import app.switchboard.net.StreamEvent
 import app.switchboard.net.ToolResult
 import app.switchboard.net.str
@@ -50,6 +55,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The tool call currently waiting for the user's Approve/Deny, if any. */
     var pendingApproval by mutableStateOf<ToolCall?>(null); private set
+    /** Short progress note shown above the composer (e.g. starting the Termux runner). */
+    var toolStatus by mutableStateOf<String?>(null); private set
     private var approvalDecision: CompletableDeferred<Approval>? = null
     /** Chats where the user picked "Always allow" (cleared when the app restarts). */
     private val alwaysAllowed = mutableSetOf<String>()
@@ -175,10 +182,47 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 Approval.ONCE -> Unit
             }
         }
-        return if (call.name == Runner.INSTALL_APK) installApk(call) else runner().execute(call)
+        return if (call.name == Runner.INSTALL_APK) installApk(call) else host().execute(call)
     }
 
-    private fun runner() = Runner(settings.runnerUrl, settings.runnerToken, settings.unrestricted)
+    private fun host(): ToolHost = when (settings.runnerMode) {
+        RunnerMode.PHONE -> PhoneHost(File(getApplication<Application>().filesDir, "workspace"))
+        RunnerMode.TERMUX -> Runner(Termux.URL, termuxToken(), settings.unrestricted)
+        RunnerMode.REMOTE -> Runner(settings.runnerUrl, settings.runnerToken, settings.unrestricted)
+    }
+
+    private fun termuxToken(): String {
+        if (settings.termuxToken.isEmpty()) {
+            val token = java.security.SecureRandom().let { r -> ByteArray(18).also(r::nextBytes) }
+                .let { android.util.Base64.encodeToString(it, android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING) }
+            updateSettings { it.copy(termuxToken = token) }
+        }
+        return settings.termuxToken
+    }
+
+    /** Termux mode: if the runner isn't answering, start it through Termux and wait for it (first start installs python). */
+    private suspend fun describeHost(): String {
+        val h = host()
+        if (settings.runnerMode != RunnerMode.TERMUX) return h.describe()
+        runCatching { return h.describe() }
+        toolStatus = "Starting the runner in Termux…"
+        try {
+            Termux.startRunner(getApplication(), termuxToken())
+            repeat(90) {
+                delay(1000)
+                runCatching { return h.describe() }
+            }
+            throw IllegalStateException("Termux didn't start the runner within 90 s. Open Termux to see what happened.")
+        } finally { toolStatus = null }
+    }
+
+    /** Settings button: start (or restart) the Termux runner now. */
+    suspend fun startTermuxRunner(): Result<String> = runCatching {
+        Termux.startRunner(getApplication(), termuxToken())
+        val h = host()
+        repeat(90) { delay(1000); runCatching { return@runCatching "Runner started: ${h.describe()}" } }
+        error("No answer after 90 s. Open Termux to check for errors.")
+    }
 
     /** Downloads the APK from the runner and hands it to Android's package installer (the user confirms). */
     private suspend fun installApk(call: ToolCall): ToolResult {
@@ -187,7 +231,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             ?: return ToolResult("Missing 'path'.", true)
         if (!path.endsWith(".apk")) return ToolResult("Only .apk files can be installed.", true)
         val dest = File(ctx.cacheDir, "apks/${File(path).name}")
-        runCatching { runner().download(path, dest) }.onFailure { return ToolResult("Download failed: ${it.message}", true) }
+        runCatching { host().fetchFile(path, dest) }.onFailure { return ToolResult("Copying the APK failed: ${it.message}", true) }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !ctx.packageManager.canRequestPackageInstalls()) {
             ctx.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${ctx.packageName}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             return ToolResult("Downloaded ${dest.length()} bytes, but Android needs the user to allow installs from Switchboard. " +
@@ -202,23 +246,32 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun buildOptions(): RequestOptions {
         val base = requestOptions()
         if (!settings.toolsEnabled) return base
-        val info = runCatching { runner().info() }
-            .map { i -> "Runner machine: ${i.str("os")}${if (i.str("termux") == "true") " — Termux on the user's Android phone (use `pkg install -y ...`; no root)" else ""}. Workspace: ${i.str("workspace")}." }
-            .getOrElse { "The runner is not reachable right now (${it.message}). If a tool fails, tell the user to start runner.py and check Settings > Tools." }
+        val info = runCatching { describeHost() }.fold(
+            { "Tools run on: $it." },
+            { "The tool machine isn't reachable right now (${it.message}). If a tool fails, tell the user how to fix it in Settings > Tools." },
+        )
+        val modeNote = when (settings.runnerMode) {
+            RunnerMode.PHONE -> "This is Switchboard's own app sandbox: Android's toybox shell only. There is no package manager, compiler, Java or Python, and nothing can be installed. " +
+                "If the task needs real tools (for example building an APK), say so and tell the user to switch Settings > Tools to \"Termux on this phone\"."
+            RunnerMode.TERMUX -> "This is Termux on the user's phone (no root). Install tools with `pkg install -y ...`. " +
+                "To build an APK without Gradle: `pkg install -y openjdk-17 aapt aapt2 d8 apksigner zip`; find android.jar with `find ${'$'}PREFIX -name android.jar`; " +
+                "then aapt2 compile/link, javac against android.jar, d8, zip the dex in, and sign with apksigner using a debug keystore made by keytool. " +
+                "Gradle also works but is slow and needs android.aapt2FromMavenOverride pointing at Termux's aapt2."
+            RunnerMode.REMOTE -> "This is the user's own computer."
+        }
         val toolNote = """
-            You can act on the user's machine with tools: run_command, write_file, read_file, and install_apk (installs an .apk onto the user's phone).
+            You can act with tools: run_command, write_file, read_file, and install_apk (installs an .apk onto the user's phone; they tap Install).
             $info
+            $modeNote
             Do the work yourself with these tools instead of telling the user to run commands: install missing packages, create files, build, fix errors, and retry.
             Keep commands non-interactive. Builds can take several minutes; set timeout_sec accordingly.
-            For Android builds in Termux, Gradle's bundled aapt2 doesn't run on ARM: install `aapt2` with pkg and set android.aapt2FromMavenOverride to its path in gradle.properties.
         """.trimIndent()
         return base.copy(system = listOf(base.system, toolNote).filter { it.isNotBlank() }.joinToString("\n\n"), tools = Runner.tools)
     }
 
-    suspend fun testRunner(): Result<String> = runCatching {
-        val i = runner().info()
-        "Connected: ${i.str("os")}${if (i.str("termux") == "true") " (Termux)" else ""}, workspace ${i.str("workspace")}"
-    }
+    suspend fun testRunner(): Result<String> = runCatching { "Connected: " + host().describe() }
+
+    fun setRunnerMode(m: RunnerMode) = updateSettings { it.copy(runnerMode = m) }
 
     fun setToolsEnabled(v: Boolean) = updateSettings { it.copy(toolsEnabled = v) }
     fun setRunner(url: String, token: String) = updateSettings { it.copy(runnerUrl = url.trim(), runnerToken = token.trim()) }

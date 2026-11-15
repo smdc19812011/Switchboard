@@ -19,6 +19,7 @@ class Store(context: Context) {
         return raw.copy(
             providers = raw.providers.map { it.copy(apiKey = SecretBox.decrypt(it.apiKey)) },
             runnerToken = SecretBox.decrypt(raw.runnerToken),
+            termuxToken = SecretBox.decrypt(raw.termuxToken),
         )
     }
 
@@ -26,6 +27,7 @@ class Store(context: Context) {
         val enc = s.copy(
             providers = s.providers.map { it.copy(apiKey = SecretBox.encrypt(it.apiKey)) },
             runnerToken = SecretBox.encrypt(s.runnerToken),
+            termuxToken = SecretBox.encrypt(s.termuxToken),
         )
         atomicWrite(settingsFile, json.encodeToString(AppSettings.serializer(), enc))
     }
