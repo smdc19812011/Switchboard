@@ -73,7 +73,7 @@ class ChatClientTest {
 
     @Test fun anthropicStreamsAndSendsCorrectRequest() = runBlocking {
         val p = Provider(name = "A", kind = ApiKind.ANTHROPIC, baseUrl = base, apiKey = "sk-test", model = "claude-opus-5-5")
-        assertEquals("Hello", ChatClient().stream(p, history, "be brief", 1000).toList().joinToString(""))
+        assertEquals("Hello", ChatClient().stream(p, history, RequestOptions(system = "be brief", maxTokens = 1000)).toList().joinToString(""))
         val (h, body) = seen.getValue("/v1/messages")
         assertEquals("sk-test", h["x-api-key"]); assertEquals("2026-10-21", h["anthropic-version"])
         assertTrue(body.contains("\"system\":\"be brief\""))
@@ -84,7 +84,7 @@ class ChatClientTest {
 
     @Test fun openAiCompatibleStreams() = runBlocking {
         val p = Provider(name = "O", kind = ApiKind.OPENAI_COMPATIBLE, baseUrl = base, apiKey = "or-key", model = "x/y")
-        assertEquals("Hi there", ChatClient().stream(p, history, "sys", 1000).toList().joinToString(""))
+        assertEquals("Hi there", ChatClient().stream(p, history, RequestOptions(system = "sys")).toList().joinToString(""))
         val (h, body) = seen.getValue("/v1/chat/completions")
         assertEquals("Bearer or-key", h["authorization"])
         assertTrue(body.startsWith("{\"model\":\"x/y\",\"stream\":true,\"messages\":[{\"role\":\"system\",\"content\":\"sys\"}"))
@@ -98,7 +98,26 @@ class ChatClientTest {
 
     @Test fun surfacesApiErrorMessage() = runBlocking {
         val p = Provider(name = "O", kind = ApiKind.OPENAI_COMPATIBLE, baseUrl = "http://127.0.0.1:${server.localPort}/bad", model = "m")
-        val e = runCatching { ChatClient().stream(p, history, "", 10).toList() }.exceptionOrNull()
+        val e = runCatching { ChatClient().stream(p, history, RequestOptions()).toList() }.exceptionOrNull()
         assertEquals("HTTP 401: invalid key", e?.message)
+    }
+
+    @Test fun extraBodyOnlyAppliesWhenUnrestricted() = runBlocking {
+        val p = Provider(name = "O", kind = ApiKind.OPENAI_COMPATIBLE, baseUrl = base, model = "x/y")
+        val extra = kotlinx.serialization.json.Json.parseToJsonElement("""{"temperature":0.3,"model":"hijack"}""") as kotlinx.serialization.json.JsonObject
+        ChatClient().stream(p, history, RequestOptions(extraBody = extra)).toList()
+        assertTrue(!seen.getValue("/v1/chat/completions").second.contains("temperature"))
+        ChatClient().stream(p, history, RequestOptions(unrestricted = true, maxTokens = 500_000, extraBody = extra)).toList()
+        val body = seen.getValue("/v1/chat/completions").second
+        assertTrue(body.contains("\"temperature\":0.3") && body.contains("\"max_tokens\":500000"))
+        assertTrue(body.contains("\"model\":\"x/y\"") && !body.contains("hijack"))
+    }
+
+    @Test fun plainHttpToRemoteHostNeedsUnrestricted() = runBlocking {
+        val p = Provider(name = "R", kind = ApiKind.OPENAI_COMPATIBLE, baseUrl = "http://example.invalid/v1", model = "m")
+        val e = runCatching { ChatClient().stream(p, history, RequestOptions()).toList() }.exceptionOrNull()
+        assertTrue(e?.message.orEmpty().startsWith("Plain http://"))
+        val e2 = runCatching { ChatClient().stream(p, history, RequestOptions(unrestricted = true)).toList() }.exceptionOrNull()
+        assertTrue(e2 != null && !e2.message.orEmpty().startsWith("Plain http://")) // passes the gate, fails on DNS instead
     }
 }

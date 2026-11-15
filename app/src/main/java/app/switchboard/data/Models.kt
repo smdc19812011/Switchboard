@@ -45,6 +45,10 @@ data class AppSettings(
     val activeProviderId: String? = null,
     val systemPrompt: String = "",
     val maxTokens: Int = 8192,
+    /** Lifts the app's own limits: plain HTTP to any host, 1M token cap, max_tokens sent everywhere, raw extra body params. */
+    val unrestricted: Boolean = false,
+    /** JSON object merged into every request body while unrestricted, e.g. {"temperature":0.7}. */
+    val extraBody: String = "",
 )
 
 /** Starting points offered in the "Add provider" dialog. Users can edit every field. */

@@ -30,6 +30,17 @@ import java.util.concurrent.TimeUnit
 
 class ApiException(message: String) : IOException(message)
 
+/** Per-request options derived from settings. */
+data class RequestOptions(
+    val system: String = "",
+    val maxTokens: Int = 8192,
+    val unrestricted: Boolean = false,
+    val extraBody: JsonObject? = null,
+)
+
+private val localHosts = setOf("localhost", "127.0.0.1", "10.0.2.2")
+fun isLocalHost(host: String) = host in localHosts || host.endsWith(".local") || host.endsWith(".lan")
+
 /** Streams replies from either an Anthropic Messages endpoint or any OpenAI-compatible /chat/completions endpoint. */
 class ChatClient {
     private val http = OkHttpClient.Builder()
@@ -39,11 +50,12 @@ class ChatClient {
     private val json = Json { ignoreUnknownKeys = true }
     private val jsonType = "application/json".toMediaType()
 
-    fun stream(p: Provider, history: List<ChatMessage>, system: String, maxTokens: Int): Flow<String> = callbackFlow {
+    fun stream(p: Provider, history: List<ChatMessage>, opts: RequestOptions): Flow<String> = callbackFlow {
         val request = when (p.kind) {
-            ApiKind.ANTHROPIC -> anthropicRequest(p, history, system, maxTokens)
-            ApiKind.OPENAI_COMPATIBLE -> openAiRequest(p, history, system)
+            ApiKind.ANTHROPIC -> anthropicRequest(p, history, opts)
+            ApiKind.OPENAI_COMPATIBLE -> openAiRequest(p, history, opts)
         }
+        checkTransport(request, opts.unrestricted)
         val call = http.newCall(request)
         try {
             call.execute().use { resp ->
@@ -69,10 +81,12 @@ class ChatClient {
         awaitClose { call.cancel() }
     }.flowOn(Dispatchers.IO)
 
-    suspend fun listModels(p: Provider): List<String> = withContext(Dispatchers.IO) {
+    suspend fun listModels(p: Provider, unrestricted: Boolean = false): List<String> = withContext(Dispatchers.IO) {
         val b = Request.Builder().url(p.baseUrl.trimEnd('/') + "/models?limit=1000").get()
         authHeaders(b, p)
-        http.newCall(b.build()).execute().use { resp ->
+        val req = b.build()
+        checkTransport(req, unrestricted)
+        http.newCall(req).execute().use { resp ->
             if (!resp.isSuccessful) throw ApiException(errorText(resp))
             val root = json.parseToJsonElement(resp.body!!.string()).jsonObject
             root["data"]?.jsonArray.orEmpty()
@@ -83,19 +97,19 @@ class ChatClient {
 
     // --- Anthropic Messages API ---
 
-    private fun anthropicRequest(p: Provider, history: List<ChatMessage>, system: String, maxTokens: Int): Request {
+    private fun anthropicRequest(p: Provider, history: List<ChatMessage>, opts: RequestOptions): Request {
         val body = buildJsonObject {
             put("model", p.model)
-            put("max_tokens", maxTokens)
+            put("max_tokens", opts.maxTokens)
             put("stream", true)
-            if (system.isNotBlank()) put("system", system)
+            if (opts.system.isNotBlank()) put("system", opts.system)
             putJsonArray("messages") {
                 for (m in mergeTurns(history)) addJsonObject {
                     put("role", if (m.role == Role.USER) "user" else "assistant")
                     put("content", m.text)
                 }
             }
-        }
+        }.withExtras(opts)
         val b = Request.Builder().url(p.baseUrl.trimEnd('/') + "/messages").post(body.toString().toRequestBody(jsonType))
         authHeaders(b, p)
         return b.build()
@@ -110,18 +124,19 @@ class ChatClient {
 
     // --- OpenAI-compatible Chat Completions ---
 
-    private fun openAiRequest(p: Provider, history: List<ChatMessage>, system: String): Request {
+    private fun openAiRequest(p: Provider, history: List<ChatMessage>, opts: RequestOptions): Request {
         val body = buildJsonObject {
             put("model", p.model)
             put("stream", true)
+            if (opts.unrestricted) put("max_tokens", opts.maxTokens)
             putJsonArray("messages") {
-                if (system.isNotBlank()) addJsonObject { put("role", "system"); put("content", system) }
+                if (opts.system.isNotBlank()) addJsonObject { put("role", "system"); put("content", opts.system) }
                 for (m in mergeTurns(history)) addJsonObject {
                     put("role", if (m.role == Role.USER) "user" else "assistant")
                     put("content", m.text)
                 }
             }
-        }
+        }.withExtras(opts)
         val b = Request.Builder().url(p.baseUrl.trimEnd('/') + "/chat/completions").post(body.toString().toRequestBody(jsonType))
         authHeaders(b, p)
         return b.build()
@@ -134,6 +149,18 @@ class ChatClient {
     }
 
     // --- shared ---
+
+    /** Extra body params apply only in unrestricted mode; they override built-in fields except model/stream/messages. */
+    private fun JsonObject.withExtras(opts: RequestOptions): JsonObject {
+        val extra = opts.extraBody?.takeIf { opts.unrestricted } ?: return this
+        val protected = setOf("model", "stream", "messages")
+        return JsonObject(this + extra.filterKeys { it !in protected })
+    }
+
+    private fun checkTransport(req: Request, unrestricted: Boolean) {
+        if (!req.isHttps && !unrestricted && !isLocalHost(req.url.host))
+            throw ApiException("Plain http:// is only allowed for local servers. Use https:// or turn on Unrestricted mode.")
+    }
 
     private fun authHeaders(b: Request.Builder, p: Provider) {
         when (p.kind) {

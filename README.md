@@ -29,6 +29,13 @@ gradle testReleaseUnitTest # streaming and protocol tests against a local mock s
 
 The release build is signed with the debug key so it installs straight away. Sign it with your own key before you distribute it.
 
+## Unrestricted mode
+This switch in Settings asks you to confirm before it turns on. It lifts the app's own limits:
+- plain `http://` works for any host (normally only localhost, `10.0.2.2`, `*.local` and `*.lan`)
+- max output tokens go up to 1,000,000 and are also sent to OpenAI-compatible providers
+- a raw JSON field (for example `{"temperature": 0.7, "provider": {"order": ["..."]}}`) is merged into every request body; `model`, `stream` and `messages` can't be overridden
+
+It does not change what a model will or won't answer. The provider and the model you pick decide that.
+
 ## Notes
-- Plain `http://` is allowed only for localhost, `10.0.2.2`, `*.local` and `*.lan`, so you can reach local servers. Every other host needs HTTPS.
 - Text only for now: no image or file attachments, and no tool use.

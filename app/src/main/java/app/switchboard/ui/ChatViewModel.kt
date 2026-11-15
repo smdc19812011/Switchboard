@@ -13,6 +13,10 @@ import app.switchboard.data.Provider
 import app.switchboard.data.Role
 import app.switchboard.data.Store
 import app.switchboard.net.ChatClient
+import app.switchboard.net.RequestOptions
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -81,7 +85,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         job = viewModelScope.launch {
             val buf = StringBuilder()
             try {
-                client.stream(provider, history, settings.systemPrompt, settings.maxTokens).collect { chunk ->
+                client.stream(provider, history, requestOptions()).collect { chunk ->
                     buf.append(chunk)
                     updateReply(reply.id) { it.copy(text = buf.toString()) }
                 }
@@ -131,9 +135,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setSystemPrompt(v: String) = updateSettings { it.copy(systemPrompt = v) }
-    fun setMaxTokens(v: Int) = updateSettings { it.copy(maxTokens = v.coerceIn(256, 128_000)) }
+    fun setMaxTokens(v: Int) = updateSettings { it.copy(maxTokens = v.coerceIn(1, maxTokenLimit)) }
 
-    suspend fun fetchModels(p: Provider): Result<List<String>> = runCatching { client.listModels(p) }
+    val maxTokenLimit get() = if (settings.unrestricted) 1_000_000 else 128_000
+
+    fun setUnrestricted(on: Boolean) = updateSettings {
+        it.copy(unrestricted = on, maxTokens = if (on) it.maxTokens else it.maxTokens.coerceAtMost(128_000))
+    }
+
+    fun setExtraBody(v: String) = updateSettings { it.copy(extraBody = v) }
+
+    /** Null when blank; throws with a readable message when not a JSON object. */
+    fun parseExtraBody(raw: String): JsonObject? {
+        if (raw.isBlank()) return null
+        return runCatching { Json.parseToJsonElement(raw).jsonObject }
+            .getOrElse { throw IllegalArgumentException("Extra body params must be a JSON object, e.g. {\"temperature\": 0.7}") }
+    }
+
+    private fun requestOptions() = RequestOptions(
+        system = settings.systemPrompt,
+        maxTokens = settings.maxTokens,
+        unrestricted = settings.unrestricted,
+        extraBody = if (settings.unrestricted) parseExtraBody(settings.extraBody) else null,
+    )
+
+    suspend fun fetchModels(p: Provider): Result<List<String>> = runCatching { client.listModels(p, settings.unrestricted) }
 
     private fun updateSettings(f: (AppSettings) -> AppSettings) {
         settings = f(settings)

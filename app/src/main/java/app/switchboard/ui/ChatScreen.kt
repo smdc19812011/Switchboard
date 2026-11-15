@@ -80,8 +80,9 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
                         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.widthIn(max = 220.dp)) {
                             Text(provider?.model?.ifBlank { "No model set" } ?: "Switchboard",
                                 style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            if (provider != null) Text(provider.name, style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+                            if (provider != null) Text(provider.name + if (vm.settings.unrestricted) " · Unrestricted" else "",
+                                style = MaterialTheme.typography.labelSmall, maxLines = 1,
+                                color = if (vm.settings.unrestricted) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         if (provider != null) Icon(Icons.Default.ExpandMore, null, Modifier.size(18.dp))
                     }
