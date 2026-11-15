@@ -63,6 +63,15 @@ import app.switchboard.data.ApiKind
 import app.switchboard.data.Presets
 import app.switchboard.data.Provider
 import app.switchboard.data.RunnerMode
+import app.switchboard.data.DailyReset
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.clickable
+import androidx.compose.runtime.LaunchedEffect
+import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import app.switchboard.net.Termux
 import java.util.UUID
 
@@ -134,6 +143,8 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                     textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
                     minLines = 3, modifier = Modifier.fillMaxWidth())
             }
+            Spacer(Modifier.size(16.dp))
+            LimitsSection(vm)
             Spacer(Modifier.size(16.dp))
             ToolsSection(vm)
             Text("API keys are encrypted with the Android Keystore and only sent to the provider's own base URL.",
@@ -307,5 +318,80 @@ private fun SetupStep(n: Int, text: String, done: Boolean) {
         Text(if (done) "✓" else "$n.", modifier = Modifier.size(width = 24.dp, height = 20.dp),
             color = if (done) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
         Text(text, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LimitsSection(vm: ChatViewModel) {
+    val s = vm.settings
+    Text("Request limits", style = MaterialTheme.typography.titleMedium)
+    Text("Shared by all chats; every model request counts, including each step of a tool run. When a limit is hit, the request waits and is sent automatically when the window opens. Leave blank for no limit.",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    var perMin by remember { mutableStateOf(if (s.maxPerMinute > 0) s.maxPerMinute.toString() else "") }
+    var perDay by remember { mutableStateOf(if (s.maxPerDay > 0) s.maxPerDay.toString() else "") }
+    fun save() = vm.setRateLimits(perMin.toIntOrNull() ?: 0, perDay.toIntOrNull() ?: 0)
+    FRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(perMin, { perMin = it.filter(Char::isDigit).take(6); save() }, label = { Text("Per minute") }, singleLine = true,
+            placeholder = { Text("No limit") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
+        OutlinedTextField(perDay, { perDay = it.filter(Char::isDigit).take(7); save() }, label = { Text("Per day") }, singleLine = true,
+            placeholder = { Text("No limit") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
+    }
+    Text("Daily limit resets", style = MaterialTheme.typography.labelMedium)
+    val resets = listOf(DailyReset.MIDNIGHT to "At midnight", DailyReset.ROLLING to "Rolling 24 hours")
+    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+        resets.forEachIndexed { i, (r, label) ->
+            SegmentedButton(selected = s.dailyReset == r, onClick = { vm.setDailyReset(r) }, shape = SegmentedButtonDefaults.itemShape(i, resets.size)) { Text(label) }
+        }
+    }
+    var usage by remember { mutableStateOf(vm.usage()) }
+    LaunchedEffect(s.dailyReset, s.timeZone) { while (true) { usage = vm.usage(); kotlinx.coroutines.delay(1000) } }
+    Text("Used: ${usage.lastMinute}${if (s.maxPerMinute > 0) " / ${s.maxPerMinute}" else ""} in the last minute · " +
+        "${usage.today}${if (s.maxPerDay > 0) " / ${s.maxPerDay}" else ""} " +
+        if (s.dailyReset == DailyReset.MIDNIGHT) "today (resets at midnight, ${vm.zone.id})" else "in the last 24 hours",
+        style = MaterialTheme.typography.bodySmall)
+
+    Spacer(Modifier.size(16.dp))
+    Text("Time zone", style = MaterialTheme.typography.titleMedium)
+    var picking by remember { mutableStateOf(false) }
+    val device = ZoneId.systemDefault().id
+    ListItem(
+        headlineContent = { Text(if (s.timeZone.isBlank()) "Device default ($device)" else s.timeZone) },
+        supportingContent = { Text("Now: " + ZonedDateTime.now(vm.zone).format(DateTimeFormatter.ofPattern("EEE, MMM d, h:mm a")) +
+            ". Used for the daily reset and to tell the model your local time.") },
+        trailingContent = { TextButton(onClick = { picking = true }) { Text("Change") } },
+    )
+    if (picking) TimeZonePicker(current = s.timeZone, onPick = { vm.setTimeZone(it); picking = false }, onDismiss = { picking = false })
+}
+
+@Composable
+private fun TimeZonePicker(current: String, onPick: (String) -> Unit, onDismiss: () -> Unit) {
+    val zones = remember { ZoneId.getAvailableZoneIds().filter { '/' in it && !it.startsWith("Etc/") && !it.startsWith("SystemV/") }.sorted() }
+    var query by remember { mutableStateOf("") }
+    val shown = zones.filter { query.isBlank() || it.replace('_', ' ').contains(query.trim(), ignoreCase = true) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Time zone") },
+        text = {
+            Column {
+                OutlinedTextField(query, { query = it }, label = { Text("Search, e.g. Manila or Europe") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                    if (query.isBlank()) item {
+                        ZoneRow("Device default (${ZoneId.systemDefault().id})", selected = current.isBlank()) { onPick("") }
+                    }
+                    items(shown, key = { it }) { id -> ZoneRow(id.replace('_', ' '), selected = id == current) { onPick(id) } }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun ZoneRow(label: String, selected: Boolean, onClick: () -> Unit) {
+    FRow(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        RadioButton(selected = selected, onClick = onClick)
+        Text(label, style = MaterialTheme.typography.bodyMedium)
     }
 }

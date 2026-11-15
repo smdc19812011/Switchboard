@@ -25,6 +25,11 @@ import app.switchboard.net.PhoneHost
 import app.switchboard.net.Termux
 import app.switchboard.net.ToolHost
 import app.switchboard.data.RunnerMode
+import app.switchboard.data.DailyReset
+import app.switchboard.data.RateLimiter
+import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.delay
 import app.switchboard.net.StreamEvent
 import app.switchboard.net.ToolResult
@@ -41,6 +46,7 @@ import kotlinx.coroutines.withContext
 
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val store = Store(app)
+    private val limiter = RateLimiter(File(app.filesDir, "request_times.csv"))
     private val client = ChatClient()
 
     var settings by mutableStateOf(AppSettings()); private set
@@ -140,7 +146,35 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Streams one model turn into a new assistant message. Returns its tool calls, or null if it failed/was stopped. */
+    val zone: ZoneId get() = runCatching { if (settings.timeZone.isBlank()) null else ZoneId.of(settings.timeZone) }.getOrNull() ?: ZoneId.systemDefault()
+
+    private fun limits() = RateLimiter.Limits(settings.maxPerMinute, settings.maxPerDay, settings.dailyReset, zone)
+
+    fun usage(): RateLimiter.Usage = limiter.usage(limits())
+
+    /**
+     * Waits until the shared per-minute/per-day limits allow another request, then counts it.
+     * Re-checks every second, so changing the limits in Settings takes effect right away. Stop cancels the wait.
+     */
+    private suspend fun awaitRateLimit() {
+        try {
+            while (true) {
+                val w = limiter.tryAcquire(limits()) ?: return
+                val left = w.untilMs - System.currentTimeMillis()
+                toolStatus = when (w.scope) {
+                    RateLimiter.Scope.MINUTE -> "Limit of ${settings.maxPerMinute} requests per minute reached. Sending in ${(left + 999) / 1000} s…"
+                    RateLimiter.Scope.DAY -> {
+                        val at = ZonedDateTime.ofInstant(java.time.Instant.ofEpochMilli(w.untilMs), zone)
+                        "Daily limit of ${settings.maxPerDay} requests reached. Sending at ${at.format(DateTimeFormatter.ofPattern("MMM d, h:mm a"))} (${zone.id}). Keep the app open."
+                    }
+                }
+                delay(left.coerceIn(200, 1000))
+            }
+        } finally { toolStatus = null }
+    }
+
     private suspend fun streamTurn(provider: Provider, opts: RequestOptions): List<ToolCall>? {
+        awaitRateLimit()
         val history = current.messages
         val reply = ChatMessage(role = Role.ASSISTANT, text = "", source = "${provider.name} · ${provider.model}")
         current = current.copy(messages = history + reply)
@@ -276,6 +310,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun setToolsEnabled(v: Boolean) = updateSettings { it.copy(toolsEnabled = v) }
     fun setRunner(url: String, token: String) = updateSettings { it.copy(runnerUrl = url.trim(), runnerToken = token.trim()) }
     fun setAskBeforeRun(v: Boolean) = updateSettings { it.copy(askBeforeRun = v) }
+    fun setRateLimits(perMinute: Int, perDay: Int) = updateSettings { it.copy(maxPerMinute = perMinute.coerceAtLeast(0), maxPerDay = perDay.coerceAtLeast(0)) }
+    fun setDailyReset(v: DailyReset) = updateSettings { it.copy(dailyReset = v) }
+    fun setTimeZone(id: String) = updateSettings { it.copy(timeZone = id) }
 
     private fun updateReply(id: String, f: (ChatMessage) -> ChatMessage) {
         current = current.copy(messages = current.messages.map { if (it.id == id) f(it) else it })
@@ -327,11 +364,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun requestOptions() = RequestOptions(
-        system = settings.systemPrompt,
+        system = listOf(settings.systemPrompt, timeNote()).filter { it.isNotBlank() }.joinToString("\n\n"),
         maxTokens = settings.maxTokens,
         unrestricted = settings.unrestricted,
         extraBody = if (settings.unrestricted) parseExtraBody(settings.extraBody) else null,
     )
+
+    private fun timeNote(): String {
+        val now = ZonedDateTime.now(zone)
+        return "Current date and time for the user: ${now.format(DateTimeFormatter.ofPattern("EEEE, MMMM d, yyyy, h:mm a"))} (${zone.id})."
+    }
 
     suspend fun fetchModels(p: Provider): Result<List<String>> = runCatching { client.listModels(p, settings.unrestricted) }
 

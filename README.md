@@ -50,6 +50,12 @@ The model loops on its own (call a tool, read the result, fix, retry, up to 40 s
 - The runner requires its token, listens only on 127.0.0.1 unless you pass `--host`, and runs with your user's permissions. Stop it with Ctrl+C when you're done.
 - The model needs to support tool calling (on OpenRouter, pick a model that lists tool support).
 
+## Request limits and time zone
+- **Per minute / per day** (Settings, then Request limits; blank means no limit) are shared by all chats and saved on the device. Every model request counts, including each step of a tool run.
+- When a limit is hit, the request waits and is sent automatically when the window opens. A countdown shows above the message box, and Stop cancels it. The app has to stay open during a long daily wait.
+- The daily limit resets **at midnight** in your time zone, or on a **rolling 24 hours**.
+- **Time zone**: device default or any IANA zone. It's used for the midnight reset and to tell the model your local date and time.
+
 ## Unrestricted mode
 This switch in Settings asks you to confirm before it turns on. It lifts the app's own limits:
 - plain `http://` works for any host (normally only localhost, `10.0.2.2`, `*.local` and `*.lan`)

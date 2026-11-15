@@ -73,6 +73,12 @@ data class AppSettings(
     val runnerToken: String = "",
     /** Show Approve/Deny before every tool action. */
     val askBeforeRun: Boolean = true,
+    /** Max model requests per minute / per day, shared by all chats. 0 = no limit. */
+    val maxPerMinute: Int = 0,
+    val maxPerDay: Int = 0,
+    val dailyReset: DailyReset = DailyReset.MIDNIGHT,
+    /** IANA zone ID like "Asia/Manila"; empty = follow the device. */
+    val timeZone: String = "",
 )
 
 /** Starting points offered in the "Add provider" dialog. Users can edit every field. */
