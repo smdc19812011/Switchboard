@@ -4,6 +4,7 @@ import app.switchboard.data.ApiKind
 import app.switchboard.data.ChatMessage
 import app.switchboard.data.Provider
 import app.switchboard.data.Role
+import app.switchboard.data.ToolCall
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -11,8 +12,14 @@ import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
@@ -20,6 +27,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -36,7 +44,17 @@ data class RequestOptions(
     val maxTokens: Int = 8192,
     val unrestricted: Boolean = false,
     val extraBody: JsonObject? = null,
+    val tools: List<ToolSpec> = emptyList(),
 )
+
+/** Provider-neutral tool definition; [schema] is a JSON Schema object. */
+data class ToolSpec(val name: String, val description: String, val schema: JsonObject)
+
+sealed interface StreamEvent {
+    data class TextDelta(val text: String) : StreamEvent
+    /** Emitted once at the end of a successful turn. */
+    data class TurnEnd(val text: String, val toolCalls: List<ToolCall>, val anthropicBlocks: String?) : StreamEvent
+}
 
 private val localHosts = setOf("localhost", "127.0.0.1", "10.0.2.2")
 fun isLocalHost(host: String) = host in localHosts || host.endsWith(".local") || host.endsWith(".lan")
@@ -50,10 +68,11 @@ class ChatClient {
     private val json = Json { ignoreUnknownKeys = true }
     private val jsonType = "application/json".toMediaType()
 
-    fun stream(p: Provider, history: List<ChatMessage>, opts: RequestOptions): Flow<String> = callbackFlow {
+    fun stream(p: Provider, history: List<ChatMessage>, opts: RequestOptions): Flow<StreamEvent> = callbackFlow {
+        val msgs = normalize(history)
         val request = when (p.kind) {
-            ApiKind.ANTHROPIC -> anthropicRequest(p, history, opts)
-            ApiKind.OPENAI_COMPATIBLE -> openAiRequest(p, history, opts)
+            ApiKind.ANTHROPIC -> anthropicRequest(p, msgs, opts)
+            ApiKind.OPENAI_COMPATIBLE -> openAiRequest(p, msgs, opts)
         }
         checkTransport(request, opts.unrestricted)
         val call = http.newCall(request)
@@ -61,18 +80,16 @@ class ChatClient {
             call.execute().use { resp ->
                 if (!resp.isSuccessful) throw ApiException(errorText(resp))
                 val source = resp.body?.source() ?: throw ApiException("Empty response")
+                val acc: TurnAccumulator = if (p.kind == ApiKind.ANTHROPIC) AnthropicAccumulator() else OpenAiAccumulator()
                 while (true) {
                     val line = source.readUtf8Line() ?: break
                     if (!line.startsWith("data:")) continue
                     val data = line.removePrefix("data:").trim()
                     if (data == "[DONE]") break
                     val obj = runCatching { json.parseToJsonElement(data).jsonObject }.getOrNull() ?: continue
-                    val text = when (p.kind) {
-                        ApiKind.ANTHROPIC -> parseAnthropicEvent(obj)
-                        ApiKind.OPENAI_COMPATIBLE -> parseOpenAiChunk(obj)
-                    }
-                    if (!text.isNullOrEmpty()) trySend(text)
+                    acc.accept(obj)?.let { trySend(StreamEvent.TextDelta(it)) }
                 }
+                trySend(acc.finish())
             }
             close()
         } catch (e: Exception) {
@@ -97,63 +114,217 @@ class ChatClient {
 
     // --- Anthropic Messages API ---
 
-    private fun anthropicRequest(p: Provider, history: List<ChatMessage>, opts: RequestOptions): Request {
-        val body = buildJsonObject {
-            put("model", p.model)
-            put("max_tokens", opts.maxTokens)
-            put("stream", true)
-            if (opts.system.isNotBlank()) put("system", opts.system)
-            putJsonArray("messages") {
-                for (m in mergeTurns(history)) addJsonObject {
-                    put("role", if (m.role == Role.USER) "user" else "assistant")
-                    put("content", m.text)
-                }
+    internal fun anthropicBody(p: Provider, msgs: List<ChatMessage>, opts: RequestOptions): JsonObject = buildJsonObject {
+        put("model", p.model)
+        put("max_tokens", opts.maxTokens)
+        put("stream", true)
+        if (opts.system.isNotBlank()) put("system", opts.system)
+        if (opts.tools.isNotEmpty()) putJsonArray("tools") {
+            for (t in opts.tools) addJsonObject { put("name", t.name); put("description", t.description); put("input_schema", t.schema) }
+        }
+        // Each turn as a content-block array; adjacent same-role turns are concatenated (tool results + text etc.).
+        val turns = mutableListOf<Pair<String, MutableList<JsonElement>>>()
+        for (m in msgs) {
+            val role = if (m.role == Role.ASSISTANT) "assistant" else "user"
+            val blocks: List<JsonElement> = when (m.role) {
+                Role.USER -> listOf(textBlock(m.text))
+                Role.TOOL -> listOf(buildJsonObject {
+                    put("type", "tool_result"); put("tool_use_id", m.toolCallId ?: ""); put("content", m.text.ifEmpty { "(no output)" })
+                    if (m.isError) put("is_error", true)
+                })
+                Role.ASSISTANT -> m.anthropicBlocks?.let { raw -> runCatching { json.parseToJsonElement(raw).jsonArray.toList() }.getOrNull() }
+                    ?: buildList {
+                        if (m.text.isNotBlank()) add(textBlock(m.text))
+                        for (c in m.toolCalls) add(buildJsonObject {
+                            put("type", "tool_use"); put("id", c.id); put("name", c.name); put("input", parseArgs(c.arguments))
+                        })
+                    }
             }
-        }.withExtras(opts)
-        val b = Request.Builder().url(p.baseUrl.trimEnd('/') + "/messages").post(body.toString().toRequestBody(jsonType))
+            if (blocks.isEmpty()) continue
+            if (turns.lastOrNull()?.first == role) turns.last().second += blocks else turns += role to blocks.toMutableList()
+        }
+        putJsonArray("messages") {
+            for ((role, blocks) in turns) addJsonObject { put("role", role); put("content", JsonArray(blocks)) }
+        }
+    }.withExtras(opts)
+
+    private fun anthropicRequest(p: Provider, msgs: List<ChatMessage>, opts: RequestOptions): Request {
+        val b = Request.Builder().url(p.baseUrl.trimEnd('/') + "/messages").post(anthropicBody(p, msgs, opts).toString().toRequestBody(jsonType))
         authHeaders(b, p)
         return b.build()
     }
 
-    private fun parseAnthropicEvent(o: JsonObject): String? = when (o.str("type")) {
-        "content_block_delta" -> o["delta"]?.jsonObject?.takeIf { it.str("type") == "text_delta" }?.str("text")
-        "message_delta" -> if (o["delta"]?.jsonObject?.str("stop_reason") == "refusal") "\n\n_[The model declined this request.]_" else null
-        "error" -> throw ApiException(o["error"]?.jsonObject?.str("message") ?: "Stream error")
-        else -> null
+    private interface TurnAccumulator {
+        /** Returns visible text to show, if any. */
+        fun accept(o: JsonObject): String?
+        fun finish(): StreamEvent.TurnEnd
+    }
+
+    /** Rebuilds every content block (text, thinking + signature, tool_use) so the turn can be replayed unchanged. */
+    private inner class AnthropicAccumulator : TurnAccumulator {
+        private val blocks = sortedMapOf<Int, MutableMap<String, JsonElement>>()
+        private val partialJson = mutableMapOf<Int, StringBuilder>()
+        private val text = StringBuilder()
+
+        override fun accept(o: JsonObject): String? {
+            when (o.str("type")) {
+                "content_block_start" -> {
+                    val i = o.int("index")
+                    blocks[i] = o["content_block"]!!.jsonObject.toMutableMap()
+                }
+                "content_block_delta" -> {
+                    val i = o.int("index"); val d = o["delta"]!!.jsonObject
+                    // Tolerate a missing content_block_start (some proxies drop it) by assuming a text block.
+                    val b = blocks.getOrPut(i) { mutableMapOf("type" to JsonPrimitive("text"), "text" to JsonPrimitive("")) }
+                    when (d.str("type")) {
+                        "text_delta" -> { val t = d.str("text").orEmpty(); b.append("text", t); text.append(t); return t }
+                        "thinking_delta" -> b.append("thinking", d.str("thinking").orEmpty())
+                        "signature_delta" -> b["signature"] = JsonPrimitive(d.str("signature").orEmpty())
+                        "input_json_delta" -> partialJson.getOrPut(i) { StringBuilder() }.append(d.str("partial_json").orEmpty())
+                    }
+                }
+                "content_block_stop" -> {
+                    val i = o.int("index"); val b = blocks[i] ?: return null
+                    if (b["type"]?.jsonPrimitive?.contentOrNull == "tool_use") b["input"] = parseArgs(partialJson[i]?.toString().orEmpty())
+                }
+                "message_delta" -> when (o["delta"]?.jsonObject?.str("stop_reason")) {
+                    "refusal" -> return "\n\n_[The model declined this request.]_".also { text.append(it) }
+                    "max_tokens" -> return "\n\n_[Stopped: reached the max output tokens limit.]_".also { text.append(it) }
+                }
+                "error" -> throw ApiException(o["error"]?.jsonObject?.str("message") ?: "Stream error")
+            }
+            return null
+        }
+
+        override fun finish(): StreamEvent.TurnEnd {
+            val all = blocks.values.map { JsonObject(it) }
+            val calls = all.filter { it.str("type") == "tool_use" }.map { ToolCall(it.str("id")!!, it.str("name")!!, it["input"].toString()) }
+            return StreamEvent.TurnEnd(text.toString(), calls, JsonArray(all).toString())
+        }
+
+        private fun MutableMap<String, JsonElement>.append(k: String, v: String) {
+            this[k] = JsonPrimitive(((this[k] as? JsonPrimitive)?.contentOrNull ?: "") + v)
+        }
     }
 
     // --- OpenAI-compatible Chat Completions ---
 
-    private fun openAiRequest(p: Provider, history: List<ChatMessage>, opts: RequestOptions): Request {
-        val body = buildJsonObject {
-            put("model", p.model)
-            put("stream", true)
-            if (opts.unrestricted) put("max_tokens", opts.maxTokens)
-            putJsonArray("messages") {
-                if (opts.system.isNotBlank()) addJsonObject { put("role", "system"); put("content", opts.system) }
-                for (m in mergeTurns(history)) addJsonObject {
-                    put("role", if (m.role == Role.USER) "user" else "assistant")
-                    put("content", m.text)
+    internal fun openAiBody(p: Provider, msgs: List<ChatMessage>, opts: RequestOptions): JsonObject = buildJsonObject {
+        put("model", p.model)
+        put("stream", true)
+        if (opts.unrestricted) put("max_tokens", opts.maxTokens)
+        if (opts.tools.isNotEmpty()) putJsonArray("tools") {
+            for (t in opts.tools) addJsonObject {
+                put("type", "function")
+                putJsonObject("function") { put("name", t.name); put("description", t.description); put("parameters", t.schema) }
+            }
+        }
+        putJsonArray("messages") {
+            if (opts.system.isNotBlank()) addJsonObject { put("role", "system"); put("content", opts.system) }
+            for (m in mergePlain(msgs)) addJsonObject {
+                when (m.role) {
+                    Role.USER -> { put("role", "user"); put("content", m.text) }
+                    Role.TOOL -> { put("role", "tool"); put("tool_call_id", m.toolCallId ?: ""); put("content", m.text.ifEmpty { "(no output)" }) }
+                    Role.ASSISTANT -> {
+                        put("role", "assistant")
+                        if (m.text.isNotBlank()) put("content", m.text) else put("content", JsonNull)
+                        if (m.toolCalls.isNotEmpty()) putJsonArray("tool_calls") {
+                            for (c in m.toolCalls) addJsonObject {
+                                put("id", c.id); put("type", "function")
+                                putJsonObject("function") { put("name", c.name); put("arguments", c.arguments) }
+                            }
+                        }
+                    }
                 }
             }
-        }.withExtras(opts)
-        val b = Request.Builder().url(p.baseUrl.trimEnd('/') + "/chat/completions").post(body.toString().toRequestBody(jsonType))
+        }
+    }.withExtras(opts)
+
+    private fun openAiRequest(p: Provider, msgs: List<ChatMessage>, opts: RequestOptions): Request {
+        val b = Request.Builder().url(p.baseUrl.trimEnd('/') + "/chat/completions").post(openAiBody(p, msgs, opts).toString().toRequestBody(jsonType))
         authHeaders(b, p)
         return b.build()
     }
 
-    private fun parseOpenAiChunk(o: JsonObject): String? {
-        o["error"]?.let { throw ApiException(it.jsonObject.str("message") ?: "Stream error") }
-        val choice = o["choices"]?.jsonArray?.firstOrNull()?.jsonObject ?: return null
-        return choice["delta"]?.jsonObject?.str("content")
+    private class OpenAiAccumulator : TurnAccumulator {
+        private val text = StringBuilder()
+        private class Partial(var id: String = "", var name: String = "", val args: StringBuilder = StringBuilder())
+        private val calls = sortedMapOf<Int, Partial>()
+
+        override fun accept(o: JsonObject): String? {
+            o["error"]?.let { throw ApiException((it as? JsonObject)?.str("message") ?: it.toString()) }
+            val choice = o["choices"]?.jsonArray?.firstOrNull()?.jsonObject ?: return null
+            val delta = choice["delta"]?.jsonObject
+            (delta?.get("tool_calls") as? JsonArray)?.forEach { el ->
+                val tc = el.jsonObject
+                val p = calls.getOrPut(tc.int("index", calls.size)) { Partial() }
+                tc.str("id")?.let { if (it.isNotEmpty()) p.id = it }
+                tc["function"]?.jsonObject?.let { f -> f.str("name")?.let { p.name += it }; f.str("arguments")?.let { p.args.append(it) } }
+            }
+            val t = delta?.str("content")
+            if (!t.isNullOrEmpty()) text.append(t)
+            if (choice.str("finish_reason") == "length") return "\n\n_[Stopped: reached the max output tokens limit.]_".also { text.append(it) }
+            return t
+        }
+
+        override fun finish() = StreamEvent.TurnEnd(
+            text.toString(),
+            calls.values.filter { it.name.isNotEmpty() }.mapIndexed { i, c ->
+                ToolCall(c.id.ifEmpty { "call_$i" }, c.name, c.args.toString().ifBlank { "{}" })
+            },
+            null,
+        )
     }
 
     // --- shared ---
 
-    /** Extra body params apply only in unrestricted mode; they override built-in fields except model/stream/messages. */
+    /**
+     * Drops failed/empty replies, and makes sure every tool call is answered right after it
+     * (a stopped or denied run would otherwise leave an orphan call, which every API rejects).
+     */
+    internal fun normalize(history: List<ChatMessage>): List<ChatMessage> {
+        val out = mutableListOf<ChatMessage>()
+        var pending = listOf<ToolCall>()
+        fun flushPending() {
+            for (c in pending) out += ChatMessage(role = Role.TOOL, text = "Not run: the user stopped this step.", toolCallId = c.id, isError = true)
+            pending = emptyList()
+        }
+        for (m in history) {
+            if (m.role == Role.TOOL) {
+                if (pending.any { it.id == m.toolCallId }) { out += m; pending = pending.filterNot { it.id == m.toolCallId } }
+                continue
+            }
+            flushPending()
+            if (m.role == Role.ASSISTANT && (m.isError || (m.text.isBlank() && m.toolCalls.isEmpty()))) continue
+            if (m.role == Role.USER && m.text.isBlank()) continue
+            out += m
+            if (m.role == Role.ASSISTANT) pending = m.toolCalls
+        }
+        flushPending()
+        return out
+    }
+
+    /** OpenAI-style APIs are fine with tool sequences but some reject back-to-back plain user (or assistant) turns. */
+    private fun mergePlain(msgs: List<ChatMessage>): List<ChatMessage> {
+        val out = mutableListOf<ChatMessage>()
+        for (m in msgs) {
+            val last = out.lastOrNull()
+            val plain = m.role != Role.TOOL && m.toolCalls.isEmpty()
+            if (last != null && plain && last.role == m.role && last.toolCalls.isEmpty()) out[out.lastIndex] = last.copy(text = last.text + "\n\n" + m.text)
+            else out += m
+        }
+        return out
+    }
+
+    private fun textBlock(t: String) = buildJsonObject { put("type", "text"); put("text", t) }
+
+    private fun parseArgs(raw: String): JsonObject =
+        runCatching { json.parseToJsonElement(raw.ifBlank { "{}" }).jsonObject }.getOrElse { buildJsonObject { } }
+
+    /** Extra body params apply only in unrestricted mode; they override built-in fields except model/stream/messages/tools. */
     private fun JsonObject.withExtras(opts: RequestOptions): JsonObject {
         val extra = opts.extraBody?.takeIf { opts.unrestricted } ?: return this
-        val protected = setOf("model", "stream", "messages")
+        val protected = setOf("model", "stream", "messages", "tools")
         return JsonObject(this + extra.filterKeys { it !in protected })
     }
 
@@ -175,18 +346,6 @@ class ChatClient {
         }
     }
 
-    /** Drops failed replies and merges back-to-back same-role turns, which strict APIs reject. */
-    private fun mergeTurns(history: List<ChatMessage>): List<ChatMessage> {
-        val out = mutableListOf<ChatMessage>()
-        for (m in history) {
-            if (m.isError || m.text.isBlank()) continue
-            val last = out.lastOrNull()
-            if (last != null && last.role == m.role) out[out.lastIndex] = last.copy(text = last.text + "\n\n" + m.text)
-            else out += m
-        }
-        return out
-    }
-
     private fun errorText(resp: Response): String {
         val raw = resp.body?.string().orEmpty()
         val msg = runCatching {
@@ -196,6 +355,7 @@ class ChatClient {
         }.getOrNull()
         return "HTTP ${resp.code}: ${msg ?: raw.take(300).ifBlank { resp.message }}"
     }
-
-    private fun JsonObject.str(k: String): String? = (this[k] as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
 }
+
+internal fun JsonObject.str(k: String): String? = (this[k] as? JsonPrimitive)?.contentOrNull
+internal fun JsonObject.int(k: String, default: Int = 0): Int = (this[k] as? JsonPrimitive)?.contentOrNull?.toIntOrNull() ?: default

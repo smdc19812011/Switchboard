@@ -12,8 +12,20 @@ import app.switchboard.data.Conversation
 import app.switchboard.data.Provider
 import app.switchboard.data.Role
 import app.switchboard.data.Store
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import androidx.core.content.FileProvider
+import app.switchboard.data.ToolCall
 import app.switchboard.net.ChatClient
 import app.switchboard.net.RequestOptions
+import app.switchboard.net.Runner
+import app.switchboard.net.StreamEvent
+import app.switchboard.net.ToolResult
+import app.switchboard.net.str
+import kotlinx.coroutines.CompletableDeferred
+import java.io.File
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
@@ -33,6 +45,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     var loaded by mutableStateOf(false); private set
 
     private var job: Job? = null
+
+    enum class Approval { ONCE, ALWAYS, DENY }
+
+    /** The tool call currently waiting for the user's Approve/Deny, if any. */
+    var pendingApproval by mutableStateOf<ToolCall?>(null); private set
+    private var approvalDecision: CompletableDeferred<Approval>? = null
+    /** Chats where the user picked "Always allow" (cleared when the app restarts). */
+    private val alwaysAllowed = mutableSetOf<String>()
 
     val activeProvider: Provider?
         get() = settings.providers.firstOrNull { it.id == settings.activeProviderId } ?: settings.providers.firstOrNull()
@@ -71,37 +91,138 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (streaming) return
         val msgs = current.messages
         if (msgs.lastOrNull()?.role != Role.ASSISTANT) return
-        current = current.copy(messages = msgs.dropLast(1))
+        // Re-run the whole last answer, including any tool steps, from the last user message.
+        val lastUser = msgs.indexOfLast { it.role == Role.USER }
+        if (lastUser < 0) return
+        current = current.copy(messages = msgs.take(lastUser + 1))
         respond(provider)
     }
 
     fun stop() { job?.cancel() }
 
     private fun respond(provider: Provider) {
-        val history = current.messages
-        val reply = ChatMessage(role = Role.ASSISTANT, text = "", source = "${provider.name} · ${provider.model}")
-        current = current.copy(messages = history + reply)
         streaming = true
         job = viewModelScope.launch {
-            val buf = StringBuilder()
             try {
-                client.stream(provider, history, requestOptions()).collect { chunk ->
-                    buf.append(chunk)
-                    updateReply(reply.id) { it.copy(text = buf.toString()) }
+                val opts = buildOptions()
+                var steps = 0
+                while (true) {
+                    val calls = streamTurn(provider, opts) ?: break
+                    if (calls.isEmpty()) break
+                    if (++steps > MAX_TOOL_STEPS) {
+                        current = current.copy(messages = current.messages + ChatMessage(role = Role.ASSISTANT,
+                            text = "Stopped after $MAX_TOOL_STEPS tool steps. Send a message to let it continue.", isError = true))
+                        break
+                    }
+                    for (call in calls) {
+                        val r = runTool(call)
+                        current = current.copy(messages = current.messages + ChatMessage(role = Role.TOOL, text = r.text, toolCallId = call.id, isError = r.isError))
+                        persistCurrent()
+                    }
                 }
-                if (buf.isEmpty()) updateReply(reply.id) { it.copy(text = "(empty response)", isError = true) }
             } catch (e: kotlinx.coroutines.CancellationException) {
-                if (buf.isEmpty()) updateReply(reply.id) { it.copy(text = "(stopped)", isError = true) }
                 throw e
-            } catch (e: Exception) {
-                val msg = e.message ?: e.javaClass.simpleName
-                updateReply(reply.id) { it.copy(text = (buf.toString() + "\n\n⚠ $msg").trim(), isError = true) }
+            } catch (e: Exception) { // e.g. invalid extra-body JSON
+                current = current.copy(messages = current.messages + ChatMessage(role = Role.ASSISTANT, text = "⚠ ${e.message}", isError = true))
             } finally {
                 streaming = false
+                pendingApproval = null
                 persistCurrent()
             }
         }
     }
+
+    /** Streams one model turn into a new assistant message. Returns its tool calls, or null if it failed/was stopped. */
+    private suspend fun streamTurn(provider: Provider, opts: RequestOptions): List<ToolCall>? {
+        val history = current.messages
+        val reply = ChatMessage(role = Role.ASSISTANT, text = "", source = "${provider.name} · ${provider.model}")
+        current = current.copy(messages = history + reply)
+        val buf = StringBuilder()
+        try {
+            var calls: List<ToolCall> = emptyList()
+            client.stream(provider, history, opts).collect { ev ->
+                when (ev) {
+                    is StreamEvent.TextDelta -> { buf.append(ev.text); updateReply(reply.id) { it.copy(text = buf.toString()) } }
+                    is StreamEvent.TurnEnd -> {
+                        calls = ev.toolCalls
+                        updateReply(reply.id) { it.copy(text = ev.text, toolCalls = ev.toolCalls, anthropicBlocks = ev.anthropicBlocks) }
+                    }
+                }
+            }
+            if (buf.isEmpty() && calls.isEmpty()) { updateReply(reply.id) { it.copy(text = "(empty response)", isError = true) }; return null }
+            return calls
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            if (buf.isEmpty()) updateReply(reply.id) { it.copy(text = "(stopped)", isError = true) }
+            throw e
+        } catch (e: Exception) {
+            val msg = e.message ?: e.javaClass.simpleName
+            updateReply(reply.id) { it.copy(text = (buf.toString() + "\n\n⚠ $msg").trim(), isError = true) }
+            return null
+        }
+    }
+
+    fun decide(a: Approval) { approvalDecision?.complete(a) }
+
+    private suspend fun runTool(call: ToolCall): ToolResult {
+        if (settings.askBeforeRun && current.id !in alwaysAllowed) {
+            val d = CompletableDeferred<Approval>()
+            approvalDecision = d
+            pendingApproval = call
+            val decision = try { d.await() } finally { pendingApproval = null; approvalDecision = null }
+            when (decision) {
+                Approval.DENY -> return ToolResult("The user denied this action. Ask them what to do instead.", isError = true)
+                Approval.ALWAYS -> alwaysAllowed += current.id
+                Approval.ONCE -> Unit
+            }
+        }
+        return if (call.name == Runner.INSTALL_APK) installApk(call) else runner().execute(call)
+    }
+
+    private fun runner() = Runner(settings.runnerUrl, settings.runnerToken, settings.unrestricted)
+
+    /** Downloads the APK from the runner and hands it to Android's package installer (the user confirms). */
+    private suspend fun installApk(call: ToolCall): ToolResult {
+        val ctx = getApplication<Application>()
+        val path = runCatching { Json.parseToJsonElement(call.arguments).jsonObject.str("path") }.getOrNull()
+            ?: return ToolResult("Missing 'path'.", true)
+        if (!path.endsWith(".apk")) return ToolResult("Only .apk files can be installed.", true)
+        val dest = File(ctx.cacheDir, "apks/${File(path).name}")
+        runCatching { runner().download(path, dest) }.onFailure { return ToolResult("Download failed: ${it.message}", true) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !ctx.packageManager.canRequestPackageInstalls()) {
+            ctx.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${ctx.packageName}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            return ToolResult("Downloaded ${dest.length()} bytes, but Android needs the user to allow installs from Switchboard. " +
+                "The settings page was opened. Once they allow it, call install_apk again.", true)
+        }
+        val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", dest)
+        ctx.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK))
+        return ToolResult("Opened Android's installer for ${dest.name} (${dest.length() / 1024} KB). The user has to tap Install; you can't see whether they did.")
+    }
+
+    private suspend fun buildOptions(): RequestOptions {
+        val base = requestOptions()
+        if (!settings.toolsEnabled) return base
+        val info = runCatching { runner().info() }
+            .map { i -> "Runner machine: ${i.str("os")}${if (i.str("termux") == "true") " — Termux on the user's Android phone (use `pkg install -y ...`; no root)" else ""}. Workspace: ${i.str("workspace")}." }
+            .getOrElse { "The runner is not reachable right now (${it.message}). If a tool fails, tell the user to start runner.py and check Settings > Tools." }
+        val toolNote = """
+            You can act on the user's machine with tools: run_command, write_file, read_file, and install_apk (installs an .apk onto the user's phone).
+            $info
+            Do the work yourself with these tools instead of telling the user to run commands: install missing packages, create files, build, fix errors, and retry.
+            Keep commands non-interactive. Builds can take several minutes; set timeout_sec accordingly.
+            For Android builds in Termux, Gradle's bundled aapt2 doesn't run on ARM: install `aapt2` with pkg and set android.aapt2FromMavenOverride to its path in gradle.properties.
+        """.trimIndent()
+        return base.copy(system = listOf(base.system, toolNote).filter { it.isNotBlank() }.joinToString("\n\n"), tools = Runner.tools)
+    }
+
+    suspend fun testRunner(): Result<String> = runCatching {
+        val i = runner().info()
+        "Connected: ${i.str("os")}${if (i.str("termux") == "true") " (Termux)" else ""}, workspace ${i.str("workspace")}"
+    }
+
+    fun setToolsEnabled(v: Boolean) = updateSettings { it.copy(toolsEnabled = v) }
+    fun setRunner(url: String, token: String) = updateSettings { it.copy(runnerUrl = url.trim(), runnerToken = token.trim()) }
+    fun setAskBeforeRun(v: Boolean) = updateSettings { it.copy(askBeforeRun = v) }
 
     private fun updateReply(id: String, f: (ChatMessage) -> ChatMessage) {
         current = current.copy(messages = current.messages.map { if (it.id == id) f(it) else it })
@@ -166,6 +287,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val snapshot = settings
         io { store.saveSettings(snapshot) }
     }
+
+    companion object { const val MAX_TOOL_STEPS = 40 }
 
     private fun io(block: () -> Unit) { viewModelScope.launch(Dispatchers.IO) { block() } }
 }

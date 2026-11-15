@@ -29,6 +29,26 @@ gradle testReleaseUnitTest # streaming and protocol tests against a local mock s
 
 The release build is signed with the debug key so it installs straight away. Sign it with your own key before you distribute it.
 
+## Tools: let the model run commands
+A phone can't run Android Studio, so Switchboard gives the model four tools and runs them through `runner.py` (Python standard library only, in `app/src/main/assets/`) on a machine you choose:
+
+| Tool | Runs on | What it does |
+|---|---|---|
+| `run_command` | runner machine | shell command (bash), up to 1 hour, returns exit code + output tail |
+| `write_file` / `read_file` | runner machine | create, overwrite or read text files (relative paths are inside `~/switchboard-workspace`) |
+| `install_apk` | this phone | downloads a built `.apk` from the runner and opens Android's installer; you tap Install |
+
+The model loops on its own (call a tool, read the result, fix, retry, up to 40 steps), so it can install packages, write a project, build it and install the APK.
+
+**Setup (Settings, then Tools)**
+- *Termux on the phone* (install Termux from F-Droid): save runner.py to Downloads, then run `pkg install -y python && termux-setup-storage`, then `python ~/storage/downloads/runner.py`, and paste the token it prints into the app. URL: `http://127.0.0.1:8765`.
+- *A computer*: run `python3 runner.py --host 0.0.0.0`, then use `http://<computer-ip>:8765` with Unrestricted mode on (plain http on your network). A computer is the most reliable way to build Android projects; in Termux, Gradle needs the `aapt2` package and `android.aapt2FromMavenOverride`.
+
+**Safety**
+- Every action shows Approve / Always / Deny first. "Always" lasts for that chat until the app restarts. You can turn approval off in Settings.
+- The runner requires its token, listens only on 127.0.0.1 unless you pass `--host`, and runs with your user's permissions. Stop it with Ctrl+C when you're done.
+- The model needs to support tool calling (on OpenRouter, pick a model that lists tool support).
+
 ## Unrestricted mode
 This switch in Settings asks you to confirm before it turns on. It lifts the app's own limits:
 - plain `http://` works for any host (normally only localhost, `10.0.2.2`, `*.local` and `*.lan`)

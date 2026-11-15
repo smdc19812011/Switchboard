@@ -35,6 +35,14 @@ import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Switch
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.layout.Row as FRow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.text.font.FontFamily
@@ -124,6 +132,8 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit) {
                     textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
                     minLines = 3, modifier = Modifier.fillMaxWidth())
             }
+            Spacer(Modifier.size(16.dp))
+            ToolsSection(vm)
             Text("API keys are encrypted with the Android Keystore and only sent to the provider's own base URL.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -193,4 +203,62 @@ private fun ProviderDialog(initial: Provider, isNew: Boolean, unrestricted: Bool
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
+}
+
+
+@Composable
+private fun ToolsSection(vm: ChatViewModel) {
+    val s = vm.settings
+    val ctx = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val scope = rememberCoroutineScope()
+    val script = remember { ctx.assets.open("runner.py").bufferedReader().use { it.readText() } }
+    var status by remember { mutableStateOf<String?>(null) }
+    val save = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/x-python")) { uri ->
+        if (uri != null) status = runCatching { ctx.contentResolver.openOutputStream(uri)!!.use { it.write(script.toByteArray()) }; "Saved runner.py" }
+            .getOrElse { "Couldn't save: ${it.message}" }
+    }
+
+    FRow(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("Tools: let the model run commands", style = MaterialTheme.typography.titleMedium)
+            Text("The model can install packages, write files, build (for example an APK) and install the result on this phone, through runner.py running in Termux or on a computer.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = s.toolsEnabled, onCheckedChange = vm::setToolsEnabled)
+    }
+    if (!s.toolsEnabled) return
+
+    Text("""
+        Setup in Termux (Termux is installed from F-Droid):
+        1. Save runner.py below to Downloads.
+        2. In Termux: pkg install -y python && termux-setup-storage
+        3. python ~/storage/downloads/runner.py
+        4. Paste the token it prints below. Keep Termux open while you chat.
+        On a computer: python3 runner.py --host 0.0.0.0, then use http://<computer-ip>:8765 (turn on Unrestricted mode for plain http on your network).
+    """.trimIndent(), style = MaterialTheme.typography.bodySmall)
+    FRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(onClick = { save.launch("runner.py") }) { Text("Save runner.py") }
+        OutlinedButton(onClick = { clipboard.setText(AnnotatedString(script)); status = "Copied runner.py to the clipboard" }) { Text("Copy") }
+    }
+    var url by remember { mutableStateOf(s.runnerUrl) }
+    var token by remember { mutableStateOf(s.runnerToken) }
+    var showToken by remember { mutableStateOf(false) }
+    OutlinedTextField(url, { url = it; vm.setRunner(it, token) }, label = { Text("Runner URL") }, singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth())
+    OutlinedTextField(token, { token = it; vm.setRunner(url, it) }, label = { Text("Runner token") }, singleLine = true,
+        visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
+        trailingIcon = { IconButton(onClick = { showToken = !showToken }) {
+            Icon(if (showToken) Icons.Default.VisibilityOff else Icons.Default.Visibility, if (showToken) "Hide token" else "Show token") } },
+        modifier = Modifier.fillMaxWidth())
+    FilledTonalButton(onClick = { status = "Connecting…"; scope.launch { status = vm.testRunner().getOrElse { "Failed: ${it.message}" } } }) { Text("Test connection") }
+    status?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+    FRow(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("Ask before each action", style = MaterialTheme.typography.bodyLarge)
+            Text("Recommended. When off, the model runs commands on that machine without asking.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = s.askBeforeRun, onCheckedChange = vm::setAskBeforeRun)
+    }
 }

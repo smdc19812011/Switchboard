@@ -16,11 +16,17 @@ class Store(context: Context) {
     fun loadSettings(): AppSettings {
         val raw = runCatching { json.decodeFromString<AppSettings>(settingsFile.readText()) }.getOrNull()
             ?: return AppSettings()
-        return raw.copy(providers = raw.providers.map { it.copy(apiKey = SecretBox.decrypt(it.apiKey)) })
+        return raw.copy(
+            providers = raw.providers.map { it.copy(apiKey = SecretBox.decrypt(it.apiKey)) },
+            runnerToken = SecretBox.decrypt(raw.runnerToken),
+        )
     }
 
     fun saveSettings(s: AppSettings) {
-        val enc = s.copy(providers = s.providers.map { it.copy(apiKey = SecretBox.encrypt(it.apiKey)) })
+        val enc = s.copy(
+            providers = s.providers.map { it.copy(apiKey = SecretBox.encrypt(it.apiKey)) },
+            runnerToken = SecretBox.encrypt(s.runnerToken),
+        )
         atomicWrite(settingsFile, json.encodeToString(AppSettings.serializer(), enc))
     }
 

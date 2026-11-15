@@ -14,6 +14,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.TextLinkStyles
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -61,7 +65,7 @@ private fun splitFences(text: String): List<Pair<Boolean, String>> {
     return parts
 }
 
-private val inlineRe = Regex("""\*\*(.+?)\*\*|`([^`]+)`|(?<![*\w])\*(?!\s)(.+?)\*(?!\w)""")
+private val inlineRe = Regex("""\*\*(.+?)\*\*|`([^`]+)`|\[([^\]]+)\]\((https?://[^)\s]+)\)|(?<![*\w])\*(?!\s)(.+?)\*(?!\w)""")
 
 private fun inline(block: String, codeBg: Color): AnnotatedString = buildAnnotatedString {
     block.lines().forEachIndexed { i, raw ->
@@ -84,10 +88,11 @@ private fun AnnotatedString.Builder.spans(line: String, codeBg: Color) {
     var pos = 0
     for (m in inlineRe.findAll(line)) {
         append(line.substring(pos, m.range.first))
-        val (bold, code, italic) = m.destructured
+        val (bold, code, linkText, linkUrl, italic) = m.destructured
         when {
             bold.isNotEmpty() -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(bold) }
             code.isNotEmpty() -> withStyle(SpanStyle(fontFamily = FontFamily.Monospace, background = codeBg)) { append(code) }
+            linkUrl.isNotEmpty() -> withLink(LinkAnnotation.Url(linkUrl, TextLinkStyles(SpanStyle(textDecoration = TextDecoration.Underline)))) { append(linkText) }
             else -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { append(italic) }
         }
         pos = m.range.last + 1

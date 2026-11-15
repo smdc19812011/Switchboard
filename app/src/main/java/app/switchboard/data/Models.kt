@@ -19,7 +19,11 @@ data class Provider(
 )
 
 @Serializable
-enum class Role { USER, ASSISTANT }
+enum class Role { USER, ASSISTANT, TOOL }
+
+/** A tool invocation requested by the model. [arguments] is the raw JSON object string. */
+@Serializable
+data class ToolCall(val id: String, val name: String, val arguments: String)
 
 @Serializable
 data class ChatMessage(
@@ -29,6 +33,12 @@ data class ChatMessage(
     /** Which provider/model produced an assistant message, shown under the bubble. */
     val source: String? = null,
     val isError: Boolean = false,
+    /** Assistant only: tools the model asked to run in this turn. */
+    val toolCalls: List<ToolCall> = emptyList(),
+    /** Assistant only: exact Anthropic content blocks (incl. thinking signatures) for faithful replay. */
+    val anthropicBlocks: String? = null,
+    /** Tool only: which call this result answers. */
+    val toolCallId: String? = null,
 )
 
 @Serializable
@@ -49,6 +59,13 @@ data class AppSettings(
     val unrestricted: Boolean = false,
     /** JSON object merged into every request body while unrestricted, e.g. {"temperature":0.7}. */
     val extraBody: String = "",
+    /** Lets the model run commands/files through a runner script the user starts (Termux or a computer). */
+    val toolsEnabled: Boolean = false,
+    val runnerUrl: String = "http://127.0.0.1:8765",
+    /** Encrypted at rest like API keys. */
+    val runnerToken: String = "",
+    /** Show Approve/Deny before every tool action. */
+    val askBeforeRun: Boolean = true,
 )
 
 /** Starting points offered in the "Add provider" dialog. Users can edit every field. */

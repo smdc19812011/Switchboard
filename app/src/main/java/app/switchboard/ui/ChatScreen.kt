@@ -61,6 +61,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.switchboard.data.ChatMessage
 import app.switchboard.data.Role
+import app.switchboard.data.ToolCall
+import app.switchboard.net.Runner
+import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.border
+import androidx.compose.material.icons.filled.Build
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.sp
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -101,7 +111,7 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
                         "Add a provider", onSettings,
                     )
                     msgs.isEmpty() -> EmptyState("What's on your mind?", "Replies come from ${provider.name}. Tap the model name above to switch at any time.", null, null)
-                    else -> MessageList(msgs, vm.streaming, onRegenerate = vm::regenerate)
+                    else -> MessageList(msgs, vm.streaming, vm.pendingApproval, onDecide = vm::decide, onRegenerate = vm::regenerate)
                 }
             }
             Composer(enabled = provider != null, streaming = vm.streaming, onSend = vm::send, onStop = vm::stop)
@@ -124,14 +134,20 @@ private fun EmptyState(title: String, body: String, action: String?, onAction: (
 }
 
 @Composable
-private fun MessageList(msgs: List<ChatMessage>, streaming: Boolean, onRegenerate: () -> Unit) {
+private fun MessageList(
+    msgs: List<ChatMessage>, streaming: Boolean, pending: ToolCall?,
+    onDecide: (ChatViewModel.Approval) -> Unit, onRegenerate: () -> Unit,
+) {
     val state = rememberLazyListState()
+    val visible = msgs.filter { it.role != Role.TOOL } // tool output is shown inside the call's card
+    val results = msgs.filter { it.role == Role.TOOL }.associateBy { it.toolCallId }
     val lastLen = msgs.lastOrNull()?.text?.length ?: 0
-    LaunchedEffect(msgs.size, lastLen) { if (msgs.isNotEmpty()) state.scrollToItem(msgs.lastIndex, Int.MAX_VALUE) }
+    LaunchedEffect(msgs.size, lastLen, pending) { if (visible.isNotEmpty()) state.scrollToItem(visible.lastIndex, Int.MAX_VALUE) }
     LazyColumn(state = state, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        items(msgs, key = { it.id }) { m ->
-            val isLast = m.id == msgs.last().id
-            if (m.role == Role.USER) UserBubble(m) else AssistantBlock(m, isLast, streaming && isLast, onRegenerate)
+        items(visible, key = { it.id }) { m ->
+            val isLast = m.id == visible.last().id
+            if (m.role == Role.USER) UserBubble(m)
+            else AssistantBlock(m, isLast, streaming && isLast, streaming, results, pending, onDecide, onRegenerate)
         }
     }
 }
@@ -147,12 +163,19 @@ private fun UserBubble(m: ChatMessage) {
 }
 
 @Composable
-private fun AssistantBlock(m: ChatMessage, isLast: Boolean, live: Boolean, onRegenerate: () -> Unit) {
+private fun AssistantBlock(
+    m: ChatMessage, isLast: Boolean, live: Boolean, busy: Boolean,
+    results: Map<String?, ChatMessage>, pending: ToolCall?,
+    onDecide: (ChatViewModel.Approval) -> Unit, onRegenerate: () -> Unit,
+) {
     val clipboard = LocalClipboardManager.current
-    Column(Modifier.fillMaxWidth()) {
-        if (m.text.isEmpty() && live) TypingDots()
-        else MarkdownText(m.text, if (m.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
-        if (!live) Row(verticalAlignment = Alignment.CenterVertically) {
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (m.text.isEmpty() && m.toolCalls.isEmpty() && live) TypingDots()
+        else if (m.text.isNotEmpty()) MarkdownText(m.text, if (m.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
+        m.toolCalls.forEach { c ->
+            ToolCard(c, results[c.id], awaiting = pending?.id == c.id, running = busy && results[c.id] == null && pending?.id != c.id, onDecide)
+        }
+        if (!live && m.toolCalls.isEmpty()) Row(verticalAlignment = Alignment.CenterVertically) {
             m.source?.let {
                 Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
@@ -160,6 +183,49 @@ private fun AssistantBlock(m: ChatMessage, isLast: Boolean, live: Boolean, onReg
             IconButton(onClick = { clipboard.setText(AnnotatedString(m.text)) }) { Icon(Icons.Default.ContentCopy, "Copy reply", Modifier.size(18.dp)) }
             if (isLast) IconButton(onClick = onRegenerate) { Icon(Icons.Default.Refresh, "Regenerate with current model", Modifier.size(20.dp)) }
         }
+    }
+}
+
+private fun toolTitle(name: String) = when (name) {
+    "run_command" -> "Run command"
+    "write_file" -> "Write file"
+    "read_file" -> "Read file"
+    Runner.INSTALL_APK -> "Install APK on this phone"
+    else -> name
+}
+
+@Composable
+private fun ToolCard(call: ToolCall, result: ChatMessage?, awaiting: Boolean, running: Boolean, onDecide: (ChatViewModel.Approval) -> Unit) {
+    var expanded by rememberSaveable(call.id) { mutableStateOf(false) }
+    val outline = if (awaiting) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).border(1.dp, outline, RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainer).animateContentSize()
+            .clickable(enabled = result != null) { expanded = !expanded }.padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Build, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.size(8.dp))
+            Text(toolTitle(call.name), style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+            when {
+                running -> CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                result != null -> Text(if (result.isError) "failed" else "done", style = MaterialTheme.typography.labelSmall,
+                    color = if (result.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+            }
+        }
+        Text(Runner.describe(call), fontFamily = FontFamily.Monospace, fontSize = 13.sp,
+            maxLines = if (expanded || awaiting) 12 else 2, overflow = TextOverflow.Ellipsis)
+        if (awaiting) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { onDecide(ChatViewModel.Approval.ONCE) }) { Text("Approve") }
+            OutlinedButton(onClick = { onDecide(ChatViewModel.Approval.ALWAYS) }) { Text("Always") }
+            TextButton(onClick = { onDecide(ChatViewModel.Approval.DENY) }) { Text("Deny") }
+        }
+        if (result != null && expanded) SelectionContainer {
+            Text(result.text, fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp)).padding(8.dp))
+        }
+        if (result != null && !expanded) Text("Tap to show output", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
