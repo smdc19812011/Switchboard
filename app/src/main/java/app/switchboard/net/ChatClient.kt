@@ -36,7 +36,14 @@ import okhttp3.Response
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
-class ApiException(message: String) : IOException(message)
+class ApiException(message: String, val httpCode: Int? = null) : IOException(message)
+
+/** Dropped connections, timeouts, rate limiting and overloaded servers are worth retrying; bad requests are not. */
+fun isRetryable(e: Throwable): Boolean = when (e) {
+    is ApiException -> e.httpCode in setOf(408, 429, 500, 502, 503, 504, 529)
+    is IOException -> true // SocketException ("Software caused connection abort"), timeouts, resets, DNS hiccups
+    else -> false
+}
 
 /** Per-request options derived from settings. */
 data class RequestOptions(
@@ -78,7 +85,7 @@ class ChatClient {
         val call = http.newCall(request)
         try {
             call.execute().use { resp ->
-                if (!resp.isSuccessful) throw ApiException(errorText(resp))
+                if (!resp.isSuccessful) throw ApiException(errorText(resp), resp.code)
                 val source = resp.body?.source() ?: throw ApiException("Empty response")
                 val acc: TurnAccumulator = if (p.kind == ApiKind.ANTHROPIC) AnthropicAccumulator() else OpenAiAccumulator()
                 while (true) {

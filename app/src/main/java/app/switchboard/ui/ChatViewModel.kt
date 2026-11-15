@@ -19,6 +19,8 @@ import android.provider.Settings
 import androidx.core.content.FileProvider
 import app.switchboard.data.ToolCall
 import app.switchboard.net.ChatClient
+import app.switchboard.net.isRetryable
+import app.switchboard.WorkService
 import app.switchboard.net.RequestOptions
 import app.switchboard.net.Runner
 import app.switchboard.net.PhoneHost
@@ -103,7 +105,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val provider = activeProvider ?: return
         if (streaming) return
         val msgs = current.messages
-        if (msgs.lastOrNull()?.role != Role.ASSISTANT) return
+        val last = msgs.lastOrNull() ?: return
+        if (last.role != Role.ASSISTANT) return
+        // A failed step (e.g. dropped connection) is retried on its own, keeping the tool work done so far.
+        if (last.isError) {
+            current = current.copy(messages = msgs.dropLast(1))
+            respond(provider)
+            return
+        }
         // Re-run the whole last answer, including any tool steps, from the last user message.
         val lastUser = msgs.indexOfLast { it.role == Role.USER }
         if (lastUser < 0) return
@@ -115,6 +124,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun respond(provider: Provider) {
         streaming = true
+        WorkService.start(getApplication(), "Replying with ${provider.model}")
         job = viewModelScope.launch {
             try {
                 val opts = buildOptions()
@@ -140,6 +150,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             } finally {
                 streaming = false
                 pendingApproval = null
+                WorkService.stop(getApplication())
                 persistCurrent()
             }
         }
@@ -173,7 +184,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         } finally { toolStatus = null }
     }
 
+    /** One model turn, retried automatically on dropped connections and overloaded servers. */
     private suspend fun streamTurn(provider: Provider, opts: RequestOptions): List<ToolCall>? {
+        val backoff = listOf(3, 10, 30) // seconds before retry 1, 2, 3
+        for (attempt in 0..backoff.size) {
+            when (val r = attemptTurn(provider, opts, finalAttempt = attempt == backoff.size)) {
+                is TurnOutcome.Done -> return r.calls
+                is TurnOutcome.Failed -> return null
+                is TurnOutcome.Retry -> try {
+                    for (left in backoff[attempt] downTo 1) {
+                        toolStatus = "Connection problem (${r.reason}). Retrying in $left s… (try ${attempt + 2} of ${backoff.size + 1})"
+                        delay(1000)
+                    }
+                } finally { toolStatus = null }
+            }
+        }
+        return null
+    }
+
+    private sealed interface TurnOutcome {
+        data class Done(val calls: List<ToolCall>) : TurnOutcome
+        data object Failed : TurnOutcome
+        data class Retry(val reason: String) : TurnOutcome
+    }
+
+    private suspend fun attemptTurn(provider: Provider, opts: RequestOptions, finalAttempt: Boolean): TurnOutcome {
         awaitRateLimit()
         val history = current.messages
         val reply = ChatMessage(role = Role.ASSISTANT, text = "", source = "${provider.name} · ${provider.model}")
@@ -190,15 +225,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
             }
-            if (buf.isEmpty() && calls.isEmpty()) { updateReply(reply.id) { it.copy(text = "(empty response)", isError = true) }; return null }
-            return calls
+            if (buf.isEmpty() && calls.isEmpty()) { updateReply(reply.id) { it.copy(text = "(empty response)", isError = true) }; return TurnOutcome.Failed }
+            return TurnOutcome.Done(calls)
         } catch (e: kotlinx.coroutines.CancellationException) {
             if (buf.isEmpty()) updateReply(reply.id) { it.copy(text = "(stopped)", isError = true) }
             throw e
         } catch (e: Exception) {
             val msg = e.message ?: e.javaClass.simpleName
-            updateReply(reply.id) { it.copy(text = (buf.toString() + "\n\n⚠ $msg").trim(), isError = true) }
-            return null
+            if (!finalAttempt && isRetryable(e)) {
+                // Drop the partial reply; the whole turn is requested again.
+                current = current.copy(messages = current.messages.filterNot { it.id == reply.id })
+                return TurnOutcome.Retry(msg)
+            }
+            val hint = if (isRetryable(e)) "\n\nTap ↻ to try this step again." else ""
+            updateReply(reply.id) { it.copy(text = (buf.toString() + "\n\n⚠ $msg$hint").trim(), isError = true) }
+            return TurnOutcome.Failed
         }
     }
 

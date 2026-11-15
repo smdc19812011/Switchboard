@@ -76,6 +76,17 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, onPickModel: () -> Unit) {
     val provider = vm.activeProvider
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val notifPermission = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()) { }
+    var askedNotif by rememberSaveable { mutableStateOf(false) }
+    val send: (String) -> Unit = { text ->
+        if (android.os.Build.VERSION.SDK_INT >= 33 && !askedNotif &&
+            ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            askedNotif = true; notifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+        vm.send(text)
+    }
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
@@ -120,7 +131,7 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
                     Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
-            Composer(enabled = provider != null, streaming = vm.streaming, onSend = vm::send, onStop = vm::stop)
+            Composer(enabled = provider != null, streaming = vm.streaming, onSend = send, onStop = vm::stop)
         }
     }
 }

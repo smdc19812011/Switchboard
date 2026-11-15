@@ -35,6 +35,10 @@ class ChatClientTest {
                 seen[path] = headers to body
                 val (code, resp) = routes[path] ?: (404 to "")
                 val bytes = resp.toByteArray()
+                if (code == 299) { // simulate the connection dying mid-stream: promise more bytes than we send
+                    s.getOutputStream().apply { write("HTTP/1.1 200 X\r\nContent-Length: ${bytes.size + 500}\r\n\r\n".toByteArray()); write(bytes); flush() }
+                    return@use
+                }
                 s.getOutputStream().apply {
                     write("HTTP/1.1 $code X\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n".toByteArray()); write(bytes); flush()
                 }
@@ -171,5 +175,21 @@ class ChatClientTest {
         val body = ChatClient().openAiBody(p, ChatClient().normalize(replay), RequestOptions()).toString()
         assertTrue(body, body.contains("{\"role\":\"tool\",\"tool_call_id\":\"call_9\",\"content\":\"Not run: the user stopped this step.\"}"))
         assertTrue(body.contains("\"tool_calls\":[{\"id\":\"call_9\""))
+    }
+
+    @Test fun droppedConnectionAndOverloadAreRetryableButBadRequestIsNot() = runBlocking {
+        val p = Provider(name = "O", kind = ApiKind.OPENAI_COMPATIBLE, baseUrl = base, model = "m")
+        routes["/v1/chat/completions"] = 299 to "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+        val dropped = runCatching { ChatClient().stream(p, history, RequestOptions()).toList() }.exceptionOrNull()
+        assertTrue("$dropped", dropped != null && isRetryable(dropped))
+
+        routes["/v1/chat/completions"] = 503 to """{"error":{"message":"overloaded"}}"""
+        val busy = runCatching { ChatClient().stream(p, history, RequestOptions()).toList() }.exceptionOrNull()
+        assertTrue("$busy", busy is ApiException && busy.httpCode == 503 && isRetryable(busy))
+
+        routes["/v1/chat/completions"] = 400 to """{"error":{"message":"bad model"}}"""
+        val bad = runCatching { ChatClient().stream(p, history, RequestOptions()).toList() }.exceptionOrNull()
+        assertTrue("$bad", bad is ApiException && !isRetryable(bad))
+        assertTrue(isRetryable(java.net.SocketException("Software caused connection abort")))
     }
 }
