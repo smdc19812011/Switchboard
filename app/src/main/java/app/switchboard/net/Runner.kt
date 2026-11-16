@@ -55,6 +55,33 @@ class Runner(private val baseUrl: String, private val token: String, private val
 
     suspend fun read(path: String): JsonObject = postJson("/read", buildJsonObject { put("path", path) })
 
+    // ---------- interactive terminals (pseudo-terminals on the runner machine) ----------
+
+    suspend fun termStart(command: String, cwd: String?, cols: Int, rows: Int): JsonObject =
+        postJson("/term/start", buildJsonObject { put("command", command); cwd?.let { put("cwd", it) }; put("cols", cols); put("rows", rows) })
+
+    suspend fun termWrite(id: String, data: ByteArray) {
+        postJson("/term/write", buildJsonObject { put("id", id); put("data", java.util.Base64.getEncoder().encodeToString(data)) })
+    }
+
+    suspend fun termResize(id: String, cols: Int, rows: Int) { postJson("/term/resize", buildJsonObject { put("id", id); put("cols", cols); put("rows", rows) }) }
+    suspend fun termKill(id: String) { postJson("/term/kill", buildJsonObject { put("id", id) }) }
+
+    class TermChunk(val data: ByteArray, val offset: Long, val alive: Boolean, val exitCode: Int?)
+
+    /** New output after byte [since], waiting up to [waitSec] seconds for it (long poll). */
+    suspend fun termRead(id: String, since: Long, waitSec: Int): TermChunk {
+        val client = http.newBuilder().readTimeout(waitSec + 20L, TimeUnit.SECONDS).build()
+        val url = url("/term/read").newBuilder().addQueryParameter("id", id).addQueryParameter("since", "$since").addQueryParameter("wait", "$waitSec").build()
+        return client.newCall(Request.Builder().url(url).header("Authorization", "Bearer $token").build()).cancellable { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) throw ApiException(errorOf(r.code, body), r.code)
+            val o = json.parseToJsonElement(body).jsonObject
+            TermChunk(java.util.Base64.getDecoder().decode(o.str("output").orEmpty()), o.str("offset")?.toLong() ?: since,
+                o.str("alive") == "true", o.str("exit_code")?.toIntOrNull())
+        }
+    }
+
     /** Streams a file from the runner into [dest]. */
     suspend fun download(path: String, dest: File) = run {
         val url = url("/download").newBuilder().addQueryParameter("path", path).build()
@@ -135,6 +162,7 @@ class Runner(private val baseUrl: String, private val token: String, private val
             val a = runCatching { Json.parseToJsonElement(call.arguments).jsonObject }.getOrNull()
             return when (call.name) {
                 "run_command" -> a?.str("command") ?: call.arguments
+                "terminal_start" -> "Terminal: " + (a?.str("command")?.ifBlank { null } ?: "shell")
                 "write_file", "read_file", INSTALL_APK, SEND_FILE -> a?.str("path") ?: call.arguments
                 else -> call.arguments
             }

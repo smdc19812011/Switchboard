@@ -116,7 +116,10 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
                         if (provider != null) Icon(Icons.Default.ExpandMore, null, Modifier.size(18.dp))
                     }
                 },
-                actions = { if (showSettings) IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Settings") } },
+                actions = {
+                    if (vm.terminalsSupported || vm.terminals.isNotEmpty()) TerminalButton(vm)
+                    if (showSettings) IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Settings") }
+                },
             )
         },
     ) { pad ->
@@ -170,6 +173,8 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
             Composer(enabled = provider != null, streaming = vm.streaming, onSend = send, onStop = vm::stop, footer = footer, footerWarn = exhausted,
                 pending = vm.pendingAttachments, attaching = vm.attaching, onAttach = vm::addAttachments, onRemove = vm::removePending)
         }
+        // Terminal window floats over the chat; minimized it's just the top-bar button and the programs keep running.
+        if (vm.terminalOpen) Box(Modifier.padding(pad).fillMaxSize().imePadding()) { TerminalWindow(vm) }
     }
 }
 

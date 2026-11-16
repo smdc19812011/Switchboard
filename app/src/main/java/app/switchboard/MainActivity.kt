@@ -102,6 +102,7 @@ class MainActivity : ComponentActivity() {
                 BackHandler(enabled = page != null) { page = null }
                 BackHandler(enabled = showSettings && page == null) { showSettings = false }
                 BackHandler(enabled = drawer.isOpen) { scope.launch { drawer.close() } }
+                BackHandler(enabled = vm.terminalOpen && page == null && !showSettings) { vm.terminalOpen = false }
 
                 if (page != null) { ManagePage(vm, page!!, onBack = { page = null }); return@SwitchboardTheme }
                 if (showSettings) { SettingsScreen(vm, onBack = { showSettings = false }, onOpen = { page = it }); return@SwitchboardTheme }

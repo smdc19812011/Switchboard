@@ -53,6 +53,15 @@ The model loops on its own (call a tool, read the result, fix, retry, up to 40 s
 - The runner requires its token, listens only on 127.0.0.1 unless you pass `--host`, and runs with your user's permissions. Stop it with Ctrl+C when you're done.
 - The model needs to support tool calling (on OpenRouter, pick a model that lists tool support).
 
+## Interactive terminals
+
+Programs that need someone at the keyboard (installers that ask questions, menus, full-screen text UIs such as htop or nano, REPLs, serial monitors, ssh, adb shell) run in real terminals on the Termux or computer runner (macOS/Linux/Termux; not Windows, not "This phone").
+- The model uses `terminal_start` (asks for approval like any command), then `terminal_send` to type, with keys like `{ENTER}`, `{UP}`, `{CTRL+C}`, and `terminal_read` to see the screen.
+- The terminal button at the top right of the chat shows how many terminals there are. The window starts minimized. Tap the button to open it.
+- The window has a tab per terminal, **+** for your own shell, maximize, and minimize. Minimizing keeps the programs running. You can drag it by its title bar.
+- It uses xterm.js (MIT), so colors and cursor movement work. Tap the terminal to type. The extra-keys row has Ctrl, ^C, Esc, Tab, arrows, Home/End and PgUp/PgDn, plus text size.
+- On a computer, copy the new `runner.py` and restart it to get terminal support. Termux updates itself automatically.
+
 ## Build Android apps on the phone (no Termux)
 In **This phone** mode the model has a `build_apk` tool. It writes the app as a web app (`index.html` plus CSS, JS and assets) in the workspace, and Switchboard packages it into a real, signed APK that's attached to the chat with an **Install** button.
 - Runtime: a 3 KB WebView activity (`tools/apk-template/`, rebuild with `build.sh`) shows `assets/www/index.html` full screen. JavaScript and localStorage are on, and links to websites open in the browser.

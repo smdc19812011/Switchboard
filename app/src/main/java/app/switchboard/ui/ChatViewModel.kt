@@ -25,6 +25,7 @@ import app.switchboard.net.isRetryable
 import app.switchboard.WorkService
 import app.switchboard.net.RequestOptions
 import app.switchboard.net.Runner
+import app.switchboard.net.ApiException
 import app.switchboard.net.PhoneHost
 import app.switchboard.net.Termux
 import app.switchboard.net.ToolHost
@@ -42,6 +43,8 @@ import app.switchboard.engine.AgentRunner
 import app.switchboard.engine.Extras
 import app.switchboard.engine.FileTools
 import app.switchboard.engine.Toolbox
+import app.switchboard.engine.TerminalHub
+import app.switchboard.engine.TermInfo
 import app.switchboard.data.ToolPackage
 import app.switchboard.data.InstallState
 import app.switchboard.build.DocMaker
@@ -113,6 +116,78 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() { devices.closeAll(); super.onCleared() }
+
+    // --- interactive terminals (runner pseudo-terminals), shown in the terminal window ---
+
+    var terminals by mutableStateOf(listOf<TermInfo>()); private set
+    /** Whether the terminal window is open (it starts minimized to the top-bar button). */
+    var terminalOpen by mutableStateOf(false)
+    var terminalSelected by mutableStateOf<String?>(null)
+    val terms = TerminalHub(viewModelScope) { list ->
+        viewModelScope.launch(Dispatchers.Main) {
+            terminals = list
+            if (terminalSelected == null || list.none { it.id == terminalSelected }) terminalSelected = list.lastOrNull()?.id
+        }
+    }
+    val terminalsSupported: Boolean get() = settings.runnerMode != RunnerMode.PHONE
+
+    private suspend fun terminalRunner(): Runner {
+        val h = host() as? Runner ?: throw ApiException("Interactive terminals need the Termux or computer runner (Settings > Tools); the phone sandbox has no terminals.")
+        describeHost() // starts the Termux runner if needed
+        return h
+    }
+
+    /** Starts a terminal; an old runner without terminal support is restarted (Termux) or reported. */
+    private suspend fun startTerminal(command: String, title: String?, cwd: String?): TermInfo {
+        val r = terminalRunner()
+        return try { terms.start(r, command, title, cwd) } catch (e: ApiException) {
+            if (!(e.message.orEmpty().contains("HTTP 404"))) throw e
+            if (settings.runnerMode == RunnerMode.TERMUX) {
+                toolStatus = "Updating the Termux runner…"
+                try { startTermuxRunner().getOrThrow() } finally { toolStatus = null }
+                terms.start(r, command, title, cwd)
+            } else throw ApiException("This runner.py is too old for terminals. Copy the new runner.py from Settings > Tools to the computer and restart it.")
+        }
+    }
+
+    /** "+" in the terminal window: a plain shell for the user. */
+    fun newShell() = viewModelScope.launch {
+        runCatching { startTerminal("", "Shell", null) }
+            .onSuccess { terminalSelected = it.id; terminalOpen = true }
+            .onFailure { oauthStatus = it.message }
+    }
+    fun termInput(id: String, data: ByteArray) = viewModelScope.launch { runCatching { terms.send(id, data) } }
+    fun termResize(id: String, cols: Int, rows: Int) = viewModelScope.launch { runCatching { terms.resize(id, cols, rows) } }
+    fun termClose(id: String) = viewModelScope.launch { terms.close(id) }
+
+    private suspend fun terminalTool(call: ToolCall): ToolResult {
+        val a = argsOf(call)
+        return runCatching {
+            when (call.name) {
+                TerminalHub.START -> {
+                    val t = startTerminal(a.str("command").orEmpty(), a.str("title"), a.str("cwd"))
+                    terms.awaitOutput(t.id, 3000)
+                    "Started terminal ${t.id}. It's in the user's terminal window.\n" + terms.modelView(t.id)
+                }
+                TerminalHub.SEND -> {
+                    val id = a.str("id") ?: error("Missing 'id'.")
+                    terms.send(id, TerminalHub.keysToBytes(a.str("text").orEmpty()))
+                    terms.awaitOutput(id, 2500)
+                    terms.modelView(id)
+                }
+                TerminalHub.READ -> {
+                    val id = a.str("id") ?: error("Missing 'id'.")
+                    terms.awaitOutput(id, (a.str("wait_ms")?.toLongOrNull() ?: 2000).coerceIn(0, 20_000))
+                    terms.modelView(id)
+                }
+                else -> {
+                    val id = a.str("id") ?: error("Missing 'id'.")
+                    terms.stop(id); delay(500)
+                    "Stopped. " + terms.modelView(id)
+                }
+            }
+        }.fold({ ToolResult(it) }, { ToolResult(it.message ?: it.javaClass.simpleName, true) })
+    }
 
     val activeProvider: Provider?
         get() = settings.providers.firstOrNull { it.id == settings.activeProviderId } ?: settings.providers.firstOrNull()
@@ -516,6 +591,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             FileTools.GENERATE_VIDEO -> return generateVideo(argsOf(call))
         }
         if (call.name == Extras.RUN_AGENT) return runAgent(call)
+        if (call.name in TerminalHub.noApproval) return terminalTool(call)
         if (settings.askBeforeRun && current.id !in alwaysAllowed && call.name !in DeviceManager.noApproval) {
             val d = CompletableDeferred<Approval>()
             approvalDecision = d
@@ -535,6 +611,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             Runner.INSTALL_APK -> installApk(call)
             in DeviceManager.names -> devices.execute(call, File(getApplication<Application>().filesDir, "workspace"), settings.unrestricted) { path, dest -> host().fetchFile(path, dest) }
             Toolbox.INSTALL_TOOL -> installTool(argsOf(call))
+            TerminalHub.START -> terminalTool(call)
             else -> host().execute(call)
         }
     }
@@ -731,9 +808,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             For other Android devices use the built-in adb tool (shell, push, install over the network); don't run adb through run_command unless the Toolbox lists Android platform tools.
             When a task needs a tool, driver or library that isn't installed, use install_tool (not a one-off install) so it's kept in the Toolbox for every future chat, project, agent and task.
             Do the work yourself with these tools instead of telling the user to run commands: install missing packages, create files, build, fix errors, and retry.
-            Keep commands non-interactive. Builds can take several minutes; set timeout_sec accordingly.
+            Keep run_command non-interactive. Builds can take several minutes; set timeout_sec accordingly.
+            ${if (settings.runnerMode != RunnerMode.PHONE) "For programs that need a person at the keyboard (prompts, menus, full-screen text UIs, REPLs, serial monitors, ssh) use terminal_start, then terminal_send / terminal_read: they run in a real terminal shown in the user's terminal window (top-right button), where the user can watch and type too. Stop terminals you no longer need." else ""}
         """.trimIndent()
-        return toolNote to (Runner.tools + DeviceManager.tools(includeDownload = settings.runnerMode == RunnerMode.PHONE) + listOfNotNull(BUILD_APK_SPEC.takeIf { settings.runnerMode == RunnerMode.PHONE }))
+        return toolNote to (Runner.tools + DeviceManager.tools(includeDownload = settings.runnerMode == RunnerMode.PHONE) + listOfNotNull(BUILD_APK_SPEC.takeIf { settings.runnerMode == RunnerMode.PHONE }) +
+            (if (settings.runnerMode != RunnerMode.PHONE) TerminalHub.tools else emptyList()))
     }
 
     // --- toolbox: tools installed once on the tool machine ---
