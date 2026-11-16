@@ -1,0 +1,35 @@
+# Publishes a GitHub Release with the APK whenever a version tag (v1.26, v1.27, ...) is pushed.
+# The APK is the signed build committed at apk/Switchboard.apk, so updates keep the same signature and install over older versions.
+name: Release APK
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.26)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          cp apk/Switchboard.apk "Switchboard-${TAG}.apk"
+          NOTES="Switchboard ${TAG}. Download the APK below and open it on your Android phone (Android 8.0+). Allow installing from your browser or files app when asked. Installs over earlier versions; your chats and settings are kept."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "Switchboard-${TAG}.apk" --clobber
+          else
+            gh release create "$TAG" "Switchboard-${TAG}.apk" --title "Switchboard ${TAG}" --notes "$NOTES" --latest
+          fi
