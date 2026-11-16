@@ -134,27 +134,34 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun terminalRunner(): Runner {
         val h = host() as? Runner ?: throw ApiException("Interactive terminals need the Termux or computer runner (Settings > Tools); the phone sandbox has no terminals.")
         describeHost() // starts the Termux runner if needed
+        val version = runCatching { h.info()["version"]?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() } }.getOrNull() ?: 1
+        if (version < RUNNER_VERSION) {
+            if (settings.runnerMode != RunnerMode.TERMUX)
+                throw ApiException("This runner.py is too old for terminals. Copy the new runner.py from Settings > Tools to the computer and restart it.")
+            // Replace the old Termux runner once; if that doesn't work, say so instead of restarting it on every call.
+            if (runnerUpdateFailed) throw ApiException("The Termux runner couldn't be updated to the version with terminals. Open Termux, type exit to close all sessions, then use Settings > Tools > Start runner now.")
+            toolStatus = "Updating the Termux runner…"
+            try { startTermuxRunner().getOrElse { runnerUpdateFailed = true; throw ApiException("Couldn't update the Termux runner: ${it.message}") } }
+            finally { toolStatus = null }
+        }
         return h
     }
 
-    /** Starts a terminal; an old runner without terminal support is restarted (Termux) or reported. */
-    private suspend fun startTerminal(command: String, title: String?, cwd: String?): TermInfo {
-        val r = terminalRunner()
-        return try { terms.start(r, command, title, cwd) } catch (e: ApiException) {
-            if (!(e.message.orEmpty().contains("HTTP 404"))) throw e
-            if (settings.runnerMode == RunnerMode.TERMUX) {
-                toolStatus = "Updating the Termux runner…"
-                try { startTermuxRunner().getOrThrow() } finally { toolStatus = null }
-                terms.start(r, command, title, cwd)
-            } else throw ApiException("This runner.py is too old for terminals. Copy the new runner.py from Settings > Tools to the computer and restart it.")
-        }
-    }
+    /** Set when replacing an old Termux runner didn't work, so later terminal calls fail fast instead of hanging. */
+    private var runnerUpdateFailed = false
 
-    /** "+" in the terminal window: a plain shell for the user. */
+    private suspend fun startTerminal(command: String, title: String?, cwd: String?): TermInfo = terms.start(terminalRunner(), command, title, cwd)
+
+    /** What the terminal window shows while it has no terminals (starting, or why it couldn't). */
+    var terminalNote by mutableStateOf<String?>(null); private set
+
+    /** "+" in the terminal window (or the top-bar button with no terminals yet): a plain shell for the user. */
     fun newShell() = viewModelScope.launch {
+        terminalOpen = true
+        terminalNote = "Starting a shell…"
         runCatching { startTerminal("", "Shell", null) }
-            .onSuccess { terminalSelected = it.id; terminalOpen = true }
-            .onFailure { oauthStatus = it.message }
+            .onSuccess { terminalSelected = it.id; terminalNote = null }
+            .onFailure { terminalNote = it.message ?: "Couldn't start a shell." }
     }
     fun termInput(id: String, data: ByteArray) = viewModelScope.launch { runCatching { terms.send(id, data) } }
     fun termResize(id: String, cols: Int, rows: Int) = viewModelScope.launch { runCatching { terms.resize(id, cols, rows) } }
@@ -680,6 +687,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** Termux mode: if the runner isn't answering, start it through Termux and wait for it (first start installs python). */
     /** When the Termux runner last failed to start; it isn't retried automatically for 10 minutes (Settings can retry now). */
     private var runnerFailedAt = 0L
+    /** runner.py version this app ships (its /info "version"). */
+    private val RUNNER_VERSION = 2
 
     private suspend fun describeHost(): String {
         val h = host()
@@ -705,9 +714,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun startTermuxRunner(): Result<String> = runCatching {
         runnerFailedAt = 0
         Termux.startRunner(getApplication(), termuxToken())
-        val h = host()
-        repeat(90) { delay(1000); runCatching { return@runCatching "Runner started: ${h.describe()}" } }
-        error("No answer after 90 s. Open Termux to check for errors.")
+        val h = host() as Runner
+        // The old runner can keep answering for a moment after the restart is requested, so wait for the current version.
+        repeat(90) {
+            delay(1000)
+            val v = runCatching { (h.info()["version"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() ?: 1 }.getOrNull()
+            if (v != null && v >= RUNNER_VERSION) { runnerUpdateFailed = false; return@runCatching "Runner started: ${h.describe()}" }
+        }
+        error("No answer from the new runner after 90 s. Open Termux to check for errors (type exit to close old sessions), then try again.")
     }
 
     /** Downloads the APK from the runner and hands it to Android's package installer (the user confirms). */

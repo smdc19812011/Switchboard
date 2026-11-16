@@ -31,6 +31,11 @@ object Termux {
             printf '%s' "${'$'}1" > ~/.switchboard/runner.py
             command -v python >/dev/null 2>&1 || yes | pkg install -y python
             [ -f ~/.switchboard/pid ] && kill "${'$'}(cat ~/.switchboard/pid)" 2>/dev/null
+            for p in /proc/[0-9]*; do
+              pid=${'$'}{p#/proc/}; [ "${'$'}pid" = "${'$'}${'$'}" ] && continue
+              tr '\0' ' ' < "${'$'}p/cmdline" 2>/dev/null | grep -q 'python[0-9.]* [^ ]*\.switchboard/runner\.py' && kill "${'$'}pid" 2>/dev/null
+            done
+            sleep 1
             echo ${'$'}${'$'} > ~/.switchboard/pid
             exec python ~/.switchboard/runner.py --port $PORT --token "${'$'}2"
         """.trimIndent()

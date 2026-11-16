@@ -120,8 +120,13 @@ fun TerminalWindow(vm: ChatViewModel) {
                 val sel = vm.terminals.firstOrNull { it.id == vm.terminalSelected }
                 if (sel == null) {
                     Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        Text("No terminals. Tap + for a shell, or ask the model to run an interactive program.", color = Color(0xFFAAAAAA),
-                            modifier = Modifier.padding(24.dp))
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
+                            val note = vm.terminalNote
+                            if (note != null && note.startsWith("Starting")) androidx.compose.material3.CircularProgressIndicator(Modifier.size(28.dp), color = Color(0xFFE6E6E6))
+                            Spacer(Modifier.height(12.dp))
+                            Text(vm.toolStatus ?: note ?: "No terminals. Tap + for a shell, or ask the model to run an interactive program.",
+                                color = Color(0xFFCCCCCC), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                        }
                     }
                 } else {
                     XtermView(vm, sel.id, Modifier.weight(1f).fillMaxWidth())

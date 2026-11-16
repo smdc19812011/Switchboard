@@ -285,7 +285,14 @@ def main():
     ARGS = p.parse_args()
     TOKEN, WORKSPACE = ARGS.token, os.path.abspath(ARGS.workspace)
     os.makedirs(WORKSPACE, exist_ok=True)
-    srv = ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)
+    for attempt in range(20):  # an older runner being replaced may still hold the port for a moment
+        try:
+            srv = ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)
+            break
+        except OSError:
+            if attempt == 19:
+                raise
+            time.sleep(0.5)
     shown = "127.0.0.1" if ARGS.host in ("127.0.0.1", "0.0.0.0") else ARGS.host
     print(f"Switchboard runner ready\n  URL:       http://{shown}:{ARGS.port}\n  Token:     {TOKEN}\n  Workspace: {WORKSPACE}", flush=True)
     if ARGS.host == "0.0.0.0":
