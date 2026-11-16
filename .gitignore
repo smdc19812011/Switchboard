@@ -5,3 +5,6 @@ local.properties
 .idea/
 *.apk
 .kotlin/
+
+# The current release APK is kept in the repo for direct download
+!apk/Switchboard.apk

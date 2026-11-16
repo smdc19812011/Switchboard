@@ -1,5 +1,7 @@
 # Switchboard
 
+**Download:** [apk/Switchboard.apk](apk/Switchboard.apk) (version 1.26, Android 8.0+). On your phone, open it and allow installing from your browser or files app when asked.
+
 A native Android chat app that lets you pick where your replies come from. You can switch between providers and models at any point in a conversation, and the whole history goes to whichever model is active.
 
 ## Supported providers
