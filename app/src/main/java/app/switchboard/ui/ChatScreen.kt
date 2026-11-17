@@ -73,6 +73,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.runtime.remember
+import androidx.compose.ui.graphics.Color
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.TextButton
@@ -276,7 +277,7 @@ private fun AssistantBlock(
     val clipboard = LocalClipboardManager.current
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (m.thinking.isNotBlank()) ThinkingBlock(m.thinking, live = live && m.text.isEmpty() && m.toolCalls.isEmpty())
-        if (m.text.isEmpty() && m.toolCalls.isEmpty() && live && m.thinking.isBlank()) TypingDots()
+        if (m.text.isEmpty() && m.toolCalls.isEmpty() && live && m.thinking.isBlank()) TypingOctopus()
         else if (m.text.isNotEmpty()) MarkdownText(m.text, if (m.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
         m.attachments.forEach { AttachmentCard(it) } // images etc. the model produced itself
         m.toolCalls.forEach { c ->
@@ -347,12 +348,78 @@ private fun ToolCard(call: ToolCall, result: ChatMessage?, awaiting: Boolean, ru
     }
 }
 
+/**
+ * Shown while a reply is being worked on: a pixel-art octopus typing on a little keyboard. Its tentacles take turns
+ * pressing keys (which light up), it bobs and blinks, and a line of "text" grows underneath.
+ */
 @Composable
-private fun TypingDots() {
-    Row(Modifier.padding(vertical = 8.dp).semantics { contentDescription = "Waiting for reply" }, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        repeat(3) { Box(Modifier.size(8.dp).background(MaterialTheme.colorScheme.secondary, CircleShape)) }
+private fun TypingOctopus() {
+    var t by remember { mutableStateOf(0) }
+    LaunchedEffect(Unit) { while (true) { kotlinx.coroutines.delay(140); t++ } }
+    val body = MaterialTheme.colorScheme.secondary
+    val shade = androidx.compose.ui.graphics.lerp(body, Color.Black, 0.35f)
+    val shine = androidx.compose.ui.graphics.lerp(body, Color.White, 0.45f)
+    val blush = Color(0xFFE8857F)
+    val pupil = Color(0xFF222222)
+    val key = MaterialTheme.colorScheme.outline
+    val plate = MaterialTheme.colorScheme.onSurfaceVariant
+    val keyLit = MaterialTheme.colorScheme.primary
+    val text = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+    val sprite = OCTOPUS
+    androidx.compose.foundation.Canvas(Modifier.padding(vertical = 4.dp).size(60.dp, 57.dp).semantics { contentDescription = "Working on a reply" }) {
+        val px = size.width / 20f
+        fun dot(x: Int, y: Int, c: Color) = drawRect(c, androidx.compose.ui.geometry.Offset(x * px, y * px), androidx.compose.ui.geometry.Size(px + 0.6f, px + 0.6f))
+        val bob = if ((t / 4) % 2 == 0) 0 else 1
+        val x0 = 3; val y0 = bob
+        val blink = t % 28 == 0 || t % 28 == 1
+        // Head.
+        sprite.forEachIndexed { r, row ->
+            row.forEachIndexed { c, ch ->
+                val color = when (ch) {
+                    'X' -> body; 'D' -> shade; 'L' -> shine; 'B' -> blush; 'M' -> shade
+                    'E' -> if (blink) (if (r == 6) shade else body) else Color.White
+                    'P' -> if (blink) shade else pupil
+                    else -> null
+                }
+                if (color != null) dot(x0 + c, y0 + r, color)
+            }
+        }
+        // Outer tentacles sway and curl; the four inner ones take turns typing.
+        val sway = (t / 3) % 2
+        listOf(1 to 10, 0 to 11, -1 to 12).forEach { (dx, dy) -> dot(x0 + dx, y0 + dy, body) }
+        dot(x0 - 1 - sway, y0 + 13, shade); dot(x0 - sway, y0 + 14, shade)
+        listOf(12 to 10, 13 to 11, 14 to 12).forEach { (dx, dy) -> dot(x0 + dx, y0 + dy, body) }
+        dot(x0 + 14 + sway, y0 + 13, shade); dot(x0 + 13 + sway, y0 + 14, shade)
+        val inner = listOf(3, 5, 8, 10)
+        val pattern = listOf(0, 2, 1, 3, 2, 0, 3, 1, 0, 3)
+        val pressing = setOfNotNull(inner[pattern[t % pattern.size]], inner[pattern[(t + 3) % pattern.size]].takeIf { t % 3 == 0 })
+        val keysRow = 15
+        inner.forEach { cx ->
+            val tip = if (cx in pressing) keysRow - 1 else keysRow - 3
+            for (y in (y0 + 10)..maxOf(y0 + 10, tip)) dot(x0 + cx, y, if (y == tip) shade else body)
+        }
+        // Keyboard: a row of keys on a base; pressed keys light up.
+        for (x in 1..18) dot(x, keysRow + 1, plate)
+        for (x in 2..17) dot(x, keysRow, if (pressing.any { x0 + it == x }) keyLit else key)
+        // The "text" being typed.
+        val len = t % 18
+        for (x in 1 until 1 + len) if (x % 5 != 0) dot(x, keysRow + 3, text)
     }
 }
+
+/** 14×10 octopus head: X body, D shading, L shine, E eye white, P pupil, B blush, M mouth. */
+private val OCTOPUS = listOf(
+    "....XXXXXX....",
+    "..XXLLXXXXXX..",
+    ".XXLXXXXXXXXX.",
+    ".XXXXXXXXXXXD.",
+    "XXXXXXXXXXXXXD",
+    "XXEEXXXXXXEEXD",
+    "XXEPXXXXXXEPXD",
+    "XXXBXXXXXXBXXD",
+    ".XXXXXMMXXXXD.",
+    "..XXXXXXXXXD..",
+)
 
 @Composable
 private fun Composer(enabled: Boolean, streaming: Boolean, onSend: (String, Boolean) -> Unit, onStop: () -> Unit, footer: String? = null, footerWarn: Boolean = false,
