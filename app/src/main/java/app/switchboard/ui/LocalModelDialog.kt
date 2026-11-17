@@ -35,6 +35,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -55,22 +56,29 @@ import java.io.File
 @Composable
 fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDismiss: () -> Unit, onSave: (Provider) -> Unit) {
     val lm0 = initial.local ?: LocalModel()
-    var name by remember { mutableStateOf(if (isNew) "Local model" else initial.name) }
-    var path by remember { mutableStateOf(lm0.path) }
-    var source by remember { mutableStateOf(lm0.source) }
-    var link by remember { mutableStateOf(lm0.source) }
-    var token by remember { mutableStateOf("") }
-    var ctx by remember { mutableStateOf(lm0.contextSize.toString()) }
-    var threads by remember { mutableStateOf(if (lm0.threads > 0) lm0.threads.toString() else "") }
-    var keep by remember { mutableStateOf(lm0.keepMinutes.toString()) }
-    var large by remember { mutableStateOf(lm0.largeMode) }
+    var name by rememberSaveable { mutableStateOf(if (isNew) "Local model" else initial.name) }
+    var path by rememberSaveable { mutableStateOf(lm0.path) }
+    var source by rememberSaveable { mutableStateOf(lm0.source) }
+    var link by rememberSaveable { mutableStateOf(lm0.source) }
+    var token by rememberSaveable { mutableStateOf("") }
+    var ctx by rememberSaveable { mutableStateOf(lm0.contextSize.toString()) }
+    var threads by rememberSaveable { mutableStateOf(if (lm0.threads > 0) lm0.threads.toString() else "") }
+    var keep by rememberSaveable { mutableStateOf(lm0.keepMinutes.toString()) }
+    var large by rememberSaveable { mutableStateOf(lm0.largeMode) }
     var info by remember { mutableStateOf<app.switchboard.local.GgufInfo?>(null) }
     var picked by remember { mutableStateOf<ChatViewModel.PickedFile?>(null) }
     var testNote by remember { mutableStateOf<String?>(null) }
     var refresh by remember { mutableStateOf(0) } // re-check file access after returning from settings
     val scope = rememberCoroutineScope()
     val status by LocalEngine.status.collectAsState()
-    val transfer = vm.modelTransfer?.takeIf { it.path == path }
+    // Downloads run app-wide, so they keep going (with a notification) when this dialog closes or the screen turns off.
+    val transfers by app.switchboard.local.ModelDownloads.all.collectAsState()
+    val transfer = transfers[path]
+    var lastUrls by rememberSaveable { mutableStateOf(listOf<String>()) }
+    var lastTotal by rememberSaveable { mutableStateOf(-1L) }
+    // The key between the app and its own engine: made once (the engine only answers requests carrying it).
+    val localKey = rememberSaveable { initial.apiKey.ifBlank { vm.settings.providers.firstOrNull { it.id == initial.id }?.apiKey.orEmpty() }.ifBlank { java.util.UUID.randomUUID().toString().replace("-", "") } }
+    var savedEarly by rememberSaveable { mutableStateOf(false) }
 
     fun chose(size: Long) {
         val want = app.switchboard.local.Fit.wantsLargeMode(size, vm.deviceRam())
@@ -102,10 +110,18 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
     fun draft(): Provider {
         val model = initial.model.takeIf { !isNew && it.isNotBlank() && path == lm0.path } ?: file.name.removeSuffix(".gguf").ifBlank { "local" }
         return initial.copy(name = name.trim().ifBlank { "Local model" }, baseUrl = LocalEngine.baseUrl,
-            apiKey = initial.apiKey.ifBlank { java.util.UUID.randomUUID().toString().replace("-", "") },
+            apiKey = localKey,
             model = model, chatModels = listOf(model), imageModels = emptyList(), audioModels = emptyList(), videoModels = emptyList(),
             local = LocalModel(path = path, source = source, contextSize = ctx.toIntOrNull()?.coerceIn(512, 262_144) ?: 8192,
                 threads = threads.toIntOrNull()?.coerceIn(0, 32) ?: 0, keepMinutes = keep.toIntOrNull()?.coerceIn(1, 1440) ?: 10, largeMode = large))
+    }
+
+    /** Saves the provider as soon as a download or copy starts, so it isn't lost if the dialog closes before it finishes. */
+    fun saveNow() { vm.upsertProvider(draft()); savedEarly = true }
+    fun download(urls: List<String>, total: Long) {
+        lastUrls = urls; lastTotal = total
+        path = if (urls.size == 1) vm.downloadModel(urls.first(), token) else vm.downloadModelParts(urls, total, token)
+        source = urls.first(); saveNow()
     }
 
     AlertDialog(onDismissRequest = onDismiss, title = { Text(if (isNew) "Add local model" else "Edit local model") }, text = {
@@ -146,14 +162,16 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
                 if (!t.finished && t.error == null) {
                     if (t.total > 0) LinearProgressIndicator(progress = { (t.done.toFloat() / t.total).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
                     else LinearProgressIndicator(Modifier.fillMaxWidth())
-                    TextButton(onClick = { vm.cancelModelTransfer() }) { Text("Cancel") }
+                    TextButton(onClick = { vm.cancelModelTransfer(t.path) }) { Text("Cancel") }
+                    if (savedEarly) Text("Saved. The download continues in the background, even with the screen off or this window closed (progress is in the notification).",
+                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                if (t.error != null && t.label.startsWith("Downloading")) TextButton(onClick = { path = vm.downloadModel(link, token) }) { Text("Try again (resumes)") }
+                if (t.error != null && t.label.startsWith("Downloading")) TextButton(onClick = { download(lastUrls.ifEmpty { listOf(link) }, lastTotal) }) { Text("Try again (resumes)") }
             }
 
             HfSearchSection(vm, token, ram, busy = transfer?.let { !it.finished && it.error == null } == true) { f ->
-                path = vm.downloadModelParts(f.urls, f.size, token); source = f.urls.first(); link = f.urls.first(); chose(f.size)
                 if (isNew && (name.isBlank() || name == "Local model")) name = f.name.removeSuffix(".gguf").substringBefore("-00001-of-")
+                chose(f.size); link = f.urls.first(); download(f.urls, f.size)
             }
             Text("Or paste a link", style = MaterialTheme.typography.labelMedium)
             OutlinedTextField(link, { link = it.trim() }, label = { Text("Download link (.gguf)") }, singleLine = true,
@@ -163,7 +181,7 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
                 visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilledTonalButton(enabled = link.startsWith("http") && (transfer == null || transfer.finished || transfer.error != null),
-                    onClick = { path = vm.downloadModel(link, token); source = link }) {
+                    onClick = { download(listOf(link), -1) }) {
                     Icon(Icons.Default.Download, null); Spacer(Modifier.size(6.dp)); Text("Download")
                 }
                 OutlinedButton(onClick = { pick.launch(arrayOf("*/*")) }) { Icon(Icons.Default.FolderOpen, null); Spacer(Modifier.size(6.dp)); Text("Choose file") }
@@ -171,7 +189,7 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
             picked?.let { f ->
                 Text("${f.name}${if (f.size > 0) " (${ModelFiles.human(f.size)})" else ""}: Switchboard can't read it where it is yet.", style = MaterialTheme.typography.bodySmall)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilledTonalButton(onClick = { path = vm.copyModel(f.uri, f.name, f.size); source = ""; picked = null; chose(f.size) }) { Text("Copy into app") }
+                    FilledTonalButton(onClick = { path = vm.copyModel(f.uri, f.name, f.size); source = ""; picked = null; chose(f.size); saveNow() }) { Text("Copy into app") }
                     if (f.path != null && !vm.hasAllFilesAccess()) OutlinedButton(onClick = { vm.openAllFilesAccessSettings() }) { Text("Allow All files access") }
                 }
                 Text(if (f.path != null) "Copying uses another ${ModelFiles.human(f.size)} of storage. Allowing All files access uses the file where it is instead (come back here after allowing)."

@@ -1461,10 +1461,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** Where downloaded and copied models go (app storage; removed with the app). */
     fun modelsDir(): File = (getApplication<Application>().getExternalFilesDir("models") ?: File(getApplication<Application>().filesDir, "models")).apply { mkdirs() }
 
-    /** A download or copy of a model file in progress (or its error). */
-    data class ModelTransfer(val path: String, val label: String, val done: Long = 0, val total: Long = -1, val error: String? = null, val finished: Boolean = false)
-    var modelTransfer by mutableStateOf<ModelTransfer?>(null); private set
-    private var transferJob: Job? = null
 
     fun deviceRam(): Long = runCatching {
         android.app.ActivityManager.MemoryInfo().also { getApplication<Application>().getSystemService(android.app.ActivityManager::class.java).getMemoryInfo(it) }.totalMem
@@ -1506,25 +1502,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         return dest.path
     }
 
-    private fun runTransfer(dest: File, label: String, work: suspend ((app.switchboard.local.ModelFiles.Progress) -> Unit) -> Unit) {
-        transferJob?.cancel()
-        modelTransfer = ModelTransfer(dest.path, label)
-        WorkService.start(getApplication(), label)
-        transferJob = viewModelScope.launch {
-            try {
-                work { pr -> viewModelScope.launch(Dispatchers.Main) { modelTransfer = modelTransfer?.takeIf { it.path == dest.path }?.copy(done = pr.done, total = pr.total) ?: modelTransfer } }
-                modelTransfer = ModelTransfer(dest.path, label, dest.length(), dest.length(), finished = true)
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                modelTransfer = null; throw e
-            } catch (e: Exception) {
-                modelTransfer = modelTransfer?.copy(error = e.message ?: e.javaClass.simpleName)
-            } finally {
-                if (!streaming && installing.isEmpty()) WorkService.stop(getApplication())
-            }
-        }
-    }
+    /** Downloads and copies run app-wide (see ModelDownloads), so they continue in the background. */
+    private fun runTransfer(dest: File, label: String, work: suspend ((app.switchboard.local.ModelFiles.Progress) -> Unit) -> Unit) =
+        app.switchboard.local.ModelDownloads.run(dest, label, work)
 
-    fun cancelModelTransfer() { transferJob?.cancel(); transferJob = null; modelTransfer = null }
+    fun cancelModelTransfer(path: String) = app.switchboard.local.ModelDownloads.cancel(path)
 
     /** Picked file: its display name, size, and the real path when it can be found (to use it in place instead of copying). */
     data class PickedFile(val uri: android.net.Uri, val name: String, val size: Long, val path: String?)

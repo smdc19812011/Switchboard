@@ -52,6 +52,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -84,7 +85,12 @@ import java.util.UUID
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpen: (String) -> Unit = {}) {
-    var editing by remember { mutableStateOf<Provider?>(null) }
+    // Kept across screen recreation (fold/unfold, screen off on a Fold); the API key is never put in saved state.
+    val providerSaver = androidx.compose.runtime.saveable.Saver<androidx.compose.runtime.MutableState<Provider?>, String>(
+        save = { st -> st.value?.let { kotlinx.serialization.json.Json.encodeToString(Provider.serializer(), it.copy(apiKey = "")) } ?: "" },
+        restore = { str -> mutableStateOf(str.takeIf { it.isNotEmpty() }?.let { runCatching { kotlinx.serialization.json.Json.decodeFromString(Provider.serializer(), it) }.getOrNull() }
+            ?.let { p -> p.copy(apiKey = vm.settings.providers.firstOrNull { it.id == p.id }?.apiKey ?: "") }) })
+    var editing by androidx.compose.runtime.saveable.rememberSaveable(saver = providerSaver) { mutableStateOf<Provider?>(null) }
     var confirmDelete by remember { mutableStateOf<Provider?>(null) }
     var presetMenu by remember { mutableStateOf(false) }
     var confirmUnrestricted by remember { mutableStateOf(false) }
@@ -115,7 +121,13 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpen: (String) -> Un
                 ListItem(
                     leadingContent = { androidx.compose.material3.Checkbox(checked = vm.rotation.any { it.id == p.id }, onCheckedChange = { vm.toggleRotation(p.id) }) },
                     headlineContent = { Text(p.name) },
-                    supportingContent = { Text(p.local?.let { "On this phone · ${java.io.File(it.path).name.ifBlank { "no model file yet" }}" } ?: "${p.model.ifBlank { "no model" }} · ${p.baseUrl}", maxLines = 2) },
+                    supportingContent = {
+                        val transfers by app.switchboard.local.ModelDownloads.all.collectAsState()
+                        val t = p.local?.let { transfers[it.path] }?.takeIf { it.active || it.error != null }
+                        Text(p.local?.let { lm -> "On this phone · ${java.io.File(lm.path).name.ifBlank { "no model file yet" }}" +
+                            (t?.let { if (it.error != null) " · download failed (edit to retry)" else " · downloading" + (if (it.percent >= 0) " ${it.percent}%" else "…") } ?: "") }
+                            ?: "${p.model.ifBlank { "no model" }} · ${p.baseUrl}", maxLines = 2)
+                    },
                     trailingContent = {
                         Row {
                             IconButton(onClick = { editing = p }) { Icon(Icons.Default.Edit, "Edit ${p.name}") }
