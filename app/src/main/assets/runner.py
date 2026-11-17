@@ -82,8 +82,9 @@ def run(command, cwd, timeout):
 def info():
     return {
         "runner": "switchboard",
-        "version": 2,
+        "version": 3,
         "terminals": os.name != "nt",
+        "jobs": True,
         "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
         "termux": "com.termux" in os.environ.get("PREFIX", ""),
         "python": sys.version.split()[0],
@@ -102,9 +103,21 @@ MAX_TERMS = 8
 class Term:
     """A program running in a pseudo-terminal, so prompts, colors and full-screen programs work."""
 
-    def __init__(self, tid, command, cwd, cols, rows):
+    def __init__(self, tid, command, cwd, cols, rows, pipe=False):
+        self.id, self.command, self.pipe = tid, command or "shell", pipe
+        self.buf, self.base, self.exit = bytearray(), 0, None
+        self.cond = threading.Condition()
+        self.started = time.time()
+        if pipe:  # a plain command with live output (run_command shown in the app's Activity tab): no terminal, no input
+            args, use_shell = shell_cmd(command)
+            os.makedirs(cwd, exist_ok=True)
+            self.proc = subprocess.Popen(args, shell=use_shell, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, start_new_session=(os.name != "nt"),
+                                         env={**os.environ, "CI": "1", "DEBIAN_FRONTEND": "noninteractive"})
+            self.master = self.proc.stdout.fileno()
+            threading.Thread(target=self._pump, daemon=True).start()
+            return
         import pty
-        self.id, self.command = tid, command or "shell"
         self.master, slave = pty.openpty()
         self.resize(cols, rows)
         sh = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
@@ -120,9 +133,6 @@ class Term:
         self.proc = subprocess.Popen(args, stdin=slave, stdout=slave, stderr=slave, cwd=cwd, env=env,
                                      preexec_fn=child_setup, close_fds=True)
         os.close(slave)
-        self.buf, self.base, self.exit = bytearray(), 0, None
-        self.cond = threading.Condition()
-        self.started = time.time()
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _pump(self):
@@ -154,13 +164,20 @@ class Term:
             return bytes(self.buf[start - self.base:]), self.base + len(self.buf), self.exit
 
     def write(self, data):
+        if self.pipe:
+            raise ValueError("this command doesn't take input")
         os.write(self.master, data)
 
     def resize(self, cols, rows):
+        if self.pipe:
+            return
         import fcntl, struct, termios
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", max(rows, 2), max(cols, 10), 0, 0))
 
     def kill(self):
+        if os.name == "nt":
+            self.proc.kill()
+            return
         for sig in (signal.SIGHUP, signal.SIGKILL):
             try:
                 os.killpg(self.proc.pid, sig)
@@ -235,14 +252,19 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[runner] $ {command}", file=sys.stderr, flush=True)
                 return self._send(200, run(command, resolve(req.get("cwd")), timeout))
             if path == "/term/start":
-                if os.name == "nt":
+                pipe = bool(req.get("pipe"))
+                if os.name == "nt" and not pipe:
                     return self._send(400, {"error": "Interactive terminals need Linux, macOS or Termux (pseudo-terminals aren't available on Windows)."})
-                for k in [k for k, t in TERMS.items() if t.exit is not None and time.time() - t.started > 3600]:
+                for k in [k for k, t in TERMS.items() if t.exit is not None and time.time() - t.started > (300 if t.pipe else 3600)]:
                     TERMS.pop(k)
-                if sum(1 for t in TERMS.values() if t.exit is None) >= MAX_TERMS:
+                if not pipe and sum(1 for t in TERMS.values() if t.exit is None and not t.pipe) >= MAX_TERMS:
                     return self._send(400, {"error": f"Too many terminals running (max {MAX_TERMS}); stop one first."})
                 tid = secrets.token_hex(4)
-                TERMS[tid] = Term(tid, req.get("command") or "", resolve(req.get("cwd")), int(req.get("cols") or 80), int(req.get("rows") or 24))
+                if pipe and not (req.get("command") or "").strip():
+                    return self._send(400, {"error": "command is required"})
+                if pipe:
+                    print(f"[runner] $ {req.get('command')}", file=sys.stderr, flush=True)
+                TERMS[tid] = Term(tid, req.get("command") or "", resolve(req.get("cwd")), int(req.get("cols") or 80), int(req.get("rows") or 24), pipe)
                 return self._send(200, TERMS[tid].info())
             if path in ("/term/write", "/term/resize", "/term/kill"):
                 t = TERMS.get(req.get("id") or "")

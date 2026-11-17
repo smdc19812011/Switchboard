@@ -115,7 +115,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpen: (String) -> Un
                 ListItem(
                     leadingContent = { androidx.compose.material3.Checkbox(checked = vm.rotation.any { it.id == p.id }, onCheckedChange = { vm.toggleRotation(p.id) }) },
                     headlineContent = { Text(p.name) },
-                    supportingContent = { Text("${p.model.ifBlank { "no model" }} · ${p.baseUrl}", maxLines = 2) },
+                    supportingContent = { Text(p.local?.let { "On this phone · ${java.io.File(it.path).name.ifBlank { "no model file yet" }}" } ?: "${p.model.ifBlank { "no model" }} · ${p.baseUrl}", maxLines = 2) },
                     trailingContent = {
                         Row {
                             IconButton(onClick = { editing = p }) { Icon(Icons.Default.Edit, "Edit ${p.name}") }
@@ -191,6 +191,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpen: (String) -> Un
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ProviderDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, unrestricted: Boolean, onDismiss: () -> Unit, onSave: (Provider) -> Unit) {
+    if (initial.local != null) { LocalModelDialog(vm, initial, isNew, onDismiss, onSave); return }
     var name by remember { mutableStateOf(initial.name) }
     var kind by remember { mutableStateOf(initial.kind) }
     var url by remember { mutableStateOf(initial.baseUrl) }

@@ -104,6 +104,8 @@ class ChatClient {
     private val jsonType = "application/json".toMediaType()
 
     fun stream(p: Provider, history: List<ChatMessage>, opts: RequestOptions): Flow<StreamEvent> = callbackFlow {
+        // A model on the phone: load it (or switch to it) first; this can take a while for big files.
+        if (p.local != null) app.switchboard.local.LocalEngine.ensure(p)
         val msgs = normalize(history, opts.media)
         val request = when (p.kind) {
             ApiKind.ANTHROPIC -> anthropicRequest(p, msgs, opts)
@@ -115,11 +117,15 @@ class ChatClient {
         launch(Dispatchers.IO) {
             try {
                 call.execute().use { resp ->
-                    if (!resp.isSuccessful) throw ApiException(errorText(resp), resp.code)
+                    if (!resp.isSuccessful) {
+                        val err = errorText(resp)
+                        throw ApiException(if (p.local != null && "context" in err.lowercase()) "$err. Raise Context in this local model's settings, or turn tools off for this chat (tool descriptions take a few thousand tokens)." else err, resp.code)
+                    }
                     val source = resp.body?.source() ?: throw ApiException("Empty response")
                     val acc: TurnAccumulator = if (p.kind == ApiKind.ANTHROPIC) AnthropicAccumulator() else OpenAiAccumulator()
                     while (true) {
                         val line = source.readUtf8Line() ?: break
+                        if (p.local != null) app.switchboard.local.LocalEngine.touch()
                         if (!line.startsWith("data:")) continue
                         val data = line.removePrefix("data:").trim()
                         if (data == "[DONE]") break
@@ -141,6 +147,8 @@ class ChatClient {
 
     /** Every model the API key can use, with input/output types and price when the provider reports them (OpenRouter does). */
     suspend fun listModelsDetailed(p: Provider, unrestricted: Boolean = false): List<ModelInfo> = withContext(Dispatchers.IO) {
+        // The local engine serves exactly the one file it was given.
+        p.local?.let { lm -> return@withContext listOf(ModelInfo(p.model.ifBlank { java.io.File(lm.path).name }, java.io.File(lm.path).name, setOf("text"), setOf("text"), true, lm.contextSize)) }
         val b = Request.Builder().url(p.baseUrl.trimEnd('/') + "/models?limit=1000").get()
         authHeaders(b, p)
         val req = b.build()

@@ -51,6 +51,23 @@ class TerminalsTest {
         @AfterClass @JvmStatic fun stop() { proc.destroy(); workspace.deleteRecursively() }
     }
 
+    /** run_command shown live: output lands in the Activity tab as it's produced, and the model gets the exit code and output. */
+    @Test fun liveCommandsStreamToActivity() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val hub = TerminalHub(scope) {}
+        try {
+            val runner = Runner("http://127.0.0.1:$port", "t", unrestricted = false)
+            assertEquals(3, runner.version())
+            val r = hub.runLive(runner, "echo one; sleep 1; echo two >&2; exit 4", null, 30)
+            assertEquals(4, r.exitCode); assertFalse(r.timedOut); assertEquals("one\ntwo", r.output.trim())
+            val shown = String(hub.snapshot(TerminalHub.ACTIVITY).first)
+            assertTrue(shown, shown.contains("$ echo one") && shown.contains("one\r\ntwo\r\n") && shown.contains("[exit 4]"))
+            val slow = hub.runLive(runner, "echo start; sleep 30", null, 2)
+            assertTrue(slow.timedOut && slow.output.contains("start"))
+            assertEquals("activity", hub.list.first().id)
+        } finally { scope.cancel() }
+    }
+
     /** An interactive prompt answered through the hub, as the model would with terminal_start / terminal_send. */
     @Test fun promptRoundTripThroughRunner() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -70,10 +87,10 @@ class TerminalsTest {
                 val (snap, upTo) = hub.snapshot(t.id)
                 assertTrue(String(snap).contains("hi Bob")); assertEquals(snap.size.toLong(), upTo)
                 hub.send(t.id, "\r".toByteArray())
-                while (hub.list.first().alive) delay(100)
-                assertFalse(hub.list.first().alive); assertEquals(0, hub.list.first().exitCode)
+                while (hub.list.first { it.id == t.id }.alive) delay(100)
+                hub.list.first { it.id == t.id }.let { assertFalse(it.alive); assertEquals(0, it.exitCode) }
                 hub.close(t.id)
-                assertTrue(hub.list.isEmpty() && changes >= 3)
+                assertTrue(hub.list.map { it.id } == listOf("activity") && changes >= 3)
             }
         } finally { scope.cancel() }
     }

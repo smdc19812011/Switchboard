@@ -46,6 +46,7 @@ import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -117,7 +118,7 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
                     }
                 },
                 actions = {
-                    if (vm.terminalsSupported || vm.terminals.isNotEmpty()) TerminalButton(vm)
+                    TerminalButton(vm)
                     if (showSettings) IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Settings") }
                 },
             )
@@ -149,7 +150,8 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
                     }
                 }
             }
-            vm.toolStatus?.let {
+            val localStatus by app.switchboard.local.LocalEngine.status.collectAsState()
+            (vm.toolStatus ?: localStatus?.takeIf { vm.streaming && it.startsWith("Loading") }?.let { "$it (loading a local model can take a minute)" })?.let {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp); Spacer(Modifier.size(8.dp))
                     Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)

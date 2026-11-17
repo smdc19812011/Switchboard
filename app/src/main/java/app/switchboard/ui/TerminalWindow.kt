@@ -65,10 +65,15 @@ import kotlin.math.roundToInt
 /** Top-bar button for the terminal window: shows how many terminals are running; tap to open or minimize the window. */
 @Composable
 fun TerminalButton(vm: ChatViewModel) {
-    val running = vm.terminals.count { it.alive }
-    IconButton(onClick = { if (vm.terminals.isEmpty() && !vm.terminalOpen) vm.newShell() else vm.terminalOpen = !vm.terminalOpen }) {
-        BadgedBox(badge = { if (vm.terminals.isNotEmpty()) Badge(containerColor = if (running > 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline) { Text("${vm.terminals.size}") } }) {
-            Icon(Icons.Default.Terminal, if (vm.terminalOpen) "Minimize terminals" else "Open terminals")
+    val terms = vm.terminals.filter { it.id != app.switchboard.engine.TerminalHub.ACTIVITY }
+    val busy = vm.commandsRunning > 0 || terms.any { it.alive }
+    IconButton(onClick = { vm.terminalOpen = !vm.terminalOpen }) {
+        BadgedBox(badge = {
+            if (terms.isNotEmpty()) Badge(containerColor = if (terms.any { it.alive }) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline) { Text("${terms.size}") }
+            else if (vm.commandsRunning > 0) Badge(containerColor = MaterialTheme.colorScheme.primary)
+        }) {
+            Icon(Icons.Default.Terminal, if (vm.terminalOpen) "Minimize terminal window" else "Open terminal window (model activity)",
+                tint = if (busy) MaterialTheme.colorScheme.primary else androidx.compose.material3.LocalContentColor.current)
         }
     }
 }
@@ -104,18 +109,29 @@ fun TerminalWindow(vm: ChatViewModel) {
                             val sel = t.id == vm.terminalSelected
                             Row(Modifier.padding(2.dp).clip(RoundedCornerShape(8.dp)).background(if (sel) Color(0xFF2E3338) else Color.Transparent)
                                 .clickable { vm.terminalSelected = t.id }.padding(start = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Box(Modifier.size(7.dp).clip(RoundedCornerShape(4.dp)).background(if (t.alive) Color(0xFF5BC97A) else Color(0xFF777777)))
+                                val lit = if (t.id == app.switchboard.engine.TerminalHub.ACTIVITY) vm.commandsRunning > 0 else t.alive
+                                Box(Modifier.size(7.dp).clip(RoundedCornerShape(4.dp)).background(if (lit) Color(0xFF5BC97A) else Color(0xFF777777)))
                                 Spacer(Modifier.width(6.dp))
+                                val activity = t.id == app.switchboard.engine.TerminalHub.ACTIVITY
                                 Text(t.title, color = Color(0xFFE6E6E6), fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 140.dp))
-                                IconButton(onClick = { vm.termClose(t.id) }, modifier = Modifier.size(30.dp)) {
+                                if (activity) Spacer(Modifier.width(10.dp).height(30.dp))
+                                else IconButton(onClick = { vm.termClose(t.id) }, modifier = Modifier.size(30.dp)) {
                                     Icon(Icons.Default.Close, "Close ${t.title}", tint = Color(0xFFAAAAAA), modifier = Modifier.size(15.dp))
                                 }
                             }
                         }
                     }
-                    IconButton(onClick = { vm.newShell() }) { Icon(Icons.Default.Add, "New shell", tint = Color(0xFFE6E6E6)) }
+                    if (vm.terminalsSupported) IconButton(onClick = { vm.newShell() }) { Icon(Icons.Default.Add, "New shell", tint = Color(0xFFE6E6E6)) }
                     IconButton(onClick = { maximized = !maximized }) { Icon(if (maximized) Icons.Default.FullscreenExit else Icons.Default.Fullscreen, if (maximized) "Restore" else "Maximize", tint = Color(0xFFE6E6E6)) }
                     IconButton(onClick = { vm.terminalOpen = false }) { Icon(Icons.Default.Minimize, "Minimize", tint = Color(0xFFE6E6E6)) }
+                }
+                (vm.toolStatus ?: vm.terminalNote)?.let { note ->
+                    Row(Modifier.fillMaxWidth().background(Color(0xFF26292D)).padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (note.startsWith("Starting") || note.startsWith("Updating")) { androidx.compose.material3.CircularProgressIndicator(Modifier.size(14.dp), color = Color(0xFFE6E6E6), strokeWidth = 2.dp); Spacer(Modifier.width(8.dp)) }
+                        Text(note, color = Color(0xFFDDDDDD), fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        if (vm.terminalNote != null) IconButton(onClick = { vm.dismissTerminalNote() }, modifier = Modifier.size(24.dp)) {
+                            Icon(Icons.Default.Close, "Dismiss", tint = Color(0xFFAAAAAA), modifier = Modifier.size(14.dp)) }
+                    }
                 }
                 val sel = vm.terminals.firstOrNull { it.id == vm.terminalSelected }
                 if (sel == null) {
@@ -130,7 +146,7 @@ fun TerminalWindow(vm: ChatViewModel) {
                     }
                 } else {
                     XtermView(vm, sel.id, Modifier.weight(1f).fillMaxWidth())
-                    if (!sel.alive) Text("Exited" + (sel.exitCode?.let { " with code $it" } ?: ""), color = Color(0xFFAAAAAA), fontSize = 12.sp,
+                    if (!sel.alive && sel.id != app.switchboard.engine.TerminalHub.ACTIVITY) Text("Exited" + (sel.exitCode?.let { " with code $it" } ?: ""), color = Color(0xFFAAAAAA), fontSize = 12.sp,
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp))
                 }
             }
@@ -191,7 +207,7 @@ private fun XtermView(vm: ChatViewModel, id: String, modifier: Modifier) {
         // Keys a phone keyboard doesn't have.
         val keys = listOf("Esc" to "\u001B", "Tab" to "\t", "↑" to "\u001B[A", "↓" to "\u001B[B", "←" to "\u001B[D", "→" to "\u001B[C",
             "|" to "|", "-" to "-", "/" to "/", "~" to "~", "Home" to "\u001B[H", "End" to "\u001B[F", "PgUp" to "\u001B[5~", "PgDn" to "\u001B[6~")
-        Row(Modifier.fillMaxWidth().background(Color(0xFF1C1F22)).horizontalScroll(rememberScrollState()).padding(horizontal = 4.dp, vertical = 3.dp),
+        if (id != app.switchboard.engine.TerminalHub.ACTIVITY) Row(Modifier.fillMaxWidth().background(Color(0xFF1C1F22)).horizontalScroll(rememberScrollState()).padding(horizontal = 4.dp, vertical = 3.dp),
             horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             KeyChip("Ctrl", active = ctrl) { ctrl = !ctrl; js("sbCtrl($ctrl)") }
             KeyChip("^C") { vm.termInput(id, byteArrayOf(3)) }

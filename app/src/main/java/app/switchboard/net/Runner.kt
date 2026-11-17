@@ -57,8 +57,12 @@ class Runner(private val baseUrl: String, private val token: String, private val
 
     // ---------- interactive terminals (pseudo-terminals on the runner machine) ----------
 
-    suspend fun termStart(command: String, cwd: String?, cols: Int, rows: Int): JsonObject =
-        postJson("/term/start", buildJsonObject { put("command", command); cwd?.let { put("cwd", it) }; put("cols", cols); put("rows", rows) })
+    /** [pipe] = a plain command with live output and no input (no pseudo-terminal), used to show run_command as it runs. */
+    suspend fun termStart(command: String, cwd: String?, cols: Int, rows: Int, pipe: Boolean = false): JsonObject =
+        postJson("/term/start", buildJsonObject { put("command", command); cwd?.let { put("cwd", it) }; put("cols", cols); put("rows", rows); if (pipe) put("pipe", true) })
+
+    /** runner.py's version (1 for runners from before versions were reported). */
+    suspend fun version(): Int = info().str("version")?.toIntOrNull() ?: 1
 
     suspend fun termWrite(id: String, data: ByteArray) {
         postJson("/term/write", buildJsonObject { put("id", id); put("data", java.util.Base64.getEncoder().encodeToString(data)) })

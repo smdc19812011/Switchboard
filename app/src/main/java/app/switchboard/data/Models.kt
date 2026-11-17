@@ -28,10 +28,26 @@ data class Provider(
     val inRotation: Boolean = false,
     /** Older per-model limits; folded into [limit] when settings load. */
     val limits: Map<String, ModelLimit> = emptyMap(),
+    /** Set for a GGUF model that runs on the phone itself (llama.cpp); [baseUrl] then points at the local engine. */
+    val local: LocalModel? = null,
 ) {
     /** Chat models to try, current first, then the rest of the priority list. */
     val chatOrder: List<String> get() = (listOf(model) + chatModels).filter { it.isNotBlank() }.distinct()
 }
+
+/** A GGUF model file on the phone, run by the built-in llama.cpp engine. */
+@Serializable
+data class LocalModel(
+    val path: String = "",
+    /** Where it came from (a link), for re-downloading. */
+    val source: String = "",
+    /** Tokens of conversation the model can see at once; more uses more memory. */
+    val contextSize: Int = 8192,
+    /** CPU threads (0 = let llama.cpp choose). */
+    val threads: Int = 0,
+    /** Unload after this many idle minutes to free memory. */
+    val keepMinutes: Int = 10,
+)
 
 /** How a toolbox entry is installed. AUTO decides from the source address. */
 @Serializable
@@ -272,5 +288,6 @@ object Presets {
         Provider(name = "OpenAI", kind = ApiKind.OPENAI_COMPATIBLE, baseUrl = "https://api.openai.com/v1", model = ""),
         Provider(name = "Ollama (emulator host)", kind = ApiKind.OPENAI_COMPATIBLE, baseUrl = "http://10.0.2.2:11434/v1", model = "llama3.2"),
         Provider(name = "Custom (OpenAI-compatible)", kind = ApiKind.OPENAI_COMPATIBLE, baseUrl = "https://", model = ""),
+        Provider(name = "Local model (GGUF on this phone)", kind = ApiKind.OPENAI_COMPATIBLE, baseUrl = "http://127.0.0.1:8737/v1", model = "", local = LocalModel()),
     )
 }

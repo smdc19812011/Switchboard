@@ -134,17 +134,59 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun terminalRunner(): Runner {
         val h = host() as? Runner ?: throw ApiException("Interactive terminals need the Termux or computer runner (Settings > Tools); the phone sandbox has no terminals.")
         describeHost() // starts the Termux runner if needed
-        val version = runCatching { h.info()["version"]?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull() } }.getOrNull() ?: 1
-        if (version < RUNNER_VERSION) {
-            if (settings.runnerMode != RunnerMode.TERMUX)
-                throw ApiException("This runner.py is too old for terminals. Copy the new runner.py from Settings > Tools to the computer and restart it.")
-            // Replace the old Termux runner once; if that doesn't work, say so instead of restarting it on every call.
-            if (runnerUpdateFailed) throw ApiException("The Termux runner couldn't be updated to the version with terminals. Open Termux, type exit to close all sessions, then use Settings > Tools > Start runner now.")
-            toolStatus = "Updating the Termux runner…"
-            try { startTermuxRunner().getOrElse { runnerUpdateFailed = true; throw ApiException("Couldn't update the Termux runner: ${it.message}") } }
-            finally { toolStatus = null }
-        }
+        if (ensureRunnerVersion(h, required = true) < 2) throw ApiException("This runner.py is too old for terminals.")
         return h
+    }
+
+    /**
+     * The runner's version, updating an old Termux runner to the one in this app first (once per session). A computer's
+     * runner can't be updated from here: with [required] that's an error, otherwise the old version is returned.
+     */
+    private suspend fun ensureRunnerVersion(h: Runner, required: Boolean): Int {
+        val version = runCatching { h.version() }.getOrDefault(1)
+        if (version >= RUNNER_VERSION) return version
+        if (settings.runnerMode != RunnerMode.TERMUX) {
+            if (required) throw ApiException("This runner.py is too old for terminals. Copy the new runner.py from Settings > Tools to the computer and restart it.")
+            return version
+        }
+        // Replace the old Termux runner once; if that doesn't work, say so instead of restarting it on every call.
+        if (runnerUpdateFailed) {
+            if (required) throw ApiException("The Termux runner couldn't be updated to the version with terminals. Open Termux, type exit to close all sessions, then use Settings > Tools > Start runner now.")
+            return version
+        }
+        toolStatus = "Updating the Termux runner…"
+        try {
+            startTermuxRunner().getOrElse { runnerUpdateFailed = true; if (required) throw ApiException("Couldn't update the Termux runner: ${it.message}") else return version }
+        } finally { toolStatus = null }
+        return runCatching { h.version() }.getOrDefault(version)
+    }
+
+    /** Commands the model is running right now (the terminal button shows activity while this is above 0). */
+    var commandsRunning by mutableStateOf(0); private set
+
+    /** run_command, shown live in the terminal window's Activity tab. */
+    private suspend fun runCommand(call: ToolCall): ToolResult {
+        val a = argsOf(call)
+        val cmd = a.str("command")?.takeIf { it.isNotBlank() } ?: return ToolResult("Missing 'command'.", true)
+        val timeout = (a.str("timeout_sec")?.toIntOrNull() ?: 600).coerceIn(1, 3600)
+        val h = host()
+        withContext(Dispatchers.Main) { commandsRunning++ }
+        try {
+            if (h is Runner && runCatching { describeHost(); ensureRunnerVersion(h, required = false) }.getOrDefault(1) >= 3) {
+                return runCatching {
+                    val r = terms.runLive(h, cmd, a.str("cwd"), timeout)
+                    val head = (if (r.timedOut) "Timed out (process killed)." else "Exit code ${r.exitCode}.") +
+                        if (r.truncated) " Output truncated to the last 20,000 characters." else ""
+                    ToolResult("$head\n${r.output}".trimEnd(), isError = r.timedOut || r.exitCode != 0)
+                }.getOrElse { if (it is kotlinx.coroutines.CancellationException) throw it; ToolResult(it.message ?: it.javaClass.simpleName, true) }
+            }
+            // The phone sandbox and older runners: show the command, then its output once it finishes.
+            terms.appendLocal(TerminalHub.ACTIVITY, "\r\n\u001B[1;36m$ $cmd\u001B[0m\r\n")
+            val res = h.execute(call)
+            terms.appendLocal(TerminalHub.ACTIVITY, res.text.substringAfter('\n', "").ifBlank { res.text } + "\n")
+            terms.appendLocal(TerminalHub.ACTIVITY, "\u001B[2m[${res.text.substringBefore('\n')}]\u001B[0m\r\n".toByteArray())
+            return res
+        } finally { withContext(Dispatchers.Main + kotlinx.coroutines.NonCancellable) { commandsRunning-- } }
     }
 
     /** Set when replacing an old Termux runner didn't work, so later terminal calls fail fast instead of hanging. */
@@ -163,6 +205,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             .onSuccess { terminalSelected = it.id; terminalNote = null }
             .onFailure { terminalNote = it.message ?: "Couldn't start a shell." }
     }
+    fun dismissTerminalNote() { terminalNote = null }
     fun termInput(id: String, data: ByteArray) = viewModelScope.launch { runCatching { terms.send(id, data) } }
     fun termResize(id: String, cols: Int, rows: Int) = viewModelScope.launch { runCatching { terms.resize(id, cols, rows) } }
     fun termClose(id: String) = viewModelScope.launch { terms.close(id) }
@@ -173,6 +216,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             when (call.name) {
                 TerminalHub.START -> {
                     val t = startTerminal(a.str("command").orEmpty(), a.str("title"), a.str("cwd"))
+                    withContext(Dispatchers.Main) { terminalSelected = t.id }
                     terms.awaitOutput(t.id, 3000)
                     "Started terminal ${t.id}. It's in the user's terminal window.\n" + terms.modelView(t.id)
                 }
@@ -506,7 +550,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun contextTooLong(e: Exception): Boolean {
         val msg = e.message.orEmpty()
         return (e as? app.switchboard.net.ApiException)?.httpCode == 413 ||
-            Regex("(?i)(context|prompt|input|token)s?.{0,40}(length|limit|too long|too large|maximum|exceed)|too many tokens").containsMatchIn(msg)
+            Regex("(?i)(context|prompt|input|token)s?.{0,40}(length|limit|too long|too large|maximum|exceed)|too many tokens|exceeds? the available context").containsMatchIn(msg)
     }
 
     /** Models that answered "tools not supported"; they get plain requests from then on (until the app restarts). */
@@ -586,6 +630,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun decide(a: Approval) { approvalDecision?.complete(a) }
 
     private suspend fun runTool(call: ToolCall): ToolResult {
+        if (call.name != "run_command") terms.appendLocal(TerminalHub.ACTIVITY,
+            "\u001B[2m› ${call.name}: ${Runner.describe(call).take(160).replace("\n", " ")}\u001B[0m\r\n".toByteArray())
         // Sending a file only copies it into the chat, so it never needs approval.
         if (call.name == Runner.SEND_FILE) return sendFile(call)
         // Building only writes inside Switchboard's storage; installing still goes through Android's own prompt.
@@ -619,6 +665,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             in DeviceManager.names -> devices.execute(call, File(getApplication<Application>().filesDir, "workspace"), settings.unrestricted) { path, dest -> host().fetchFile(path, dest) }
             Toolbox.INSTALL_TOOL -> installTool(argsOf(call))
             TerminalHub.START -> terminalTool(call)
+            "run_command" -> runCommand(call)
             else -> host().execute(call)
         }
     }
@@ -688,7 +735,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** When the Termux runner last failed to start; it isn't retried automatically for 10 minutes (Settings can retry now). */
     private var runnerFailedAt = 0L
     /** runner.py version this app ships (its /info "version"). */
-    private val RUNNER_VERSION = 2
+    private val RUNNER_VERSION = 3
 
     private suspend fun describeHost(): String {
         val h = host()
@@ -1405,6 +1452,110 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun fetchModels(p: Provider): Result<List<String>> = runCatching { client.listModels(p, settings.unrestricted) }
 
     /** Models the provider offers to this API key, with what each can produce. */
+    // --- local GGUF models (llama.cpp on the phone) ---
+
+    /** The bundled engine is arm64 only. */
+    val localSupported: Boolean get() = app.switchboard.local.LocalEngine.binary != null && "arm64-v8a" in android.os.Build.SUPPORTED_ABIS
+
+    /** Where downloaded and copied models go (app storage; removed with the app). */
+    fun modelsDir(): File = (getApplication<Application>().getExternalFilesDir("models") ?: File(getApplication<Application>().filesDir, "models")).apply { mkdirs() }
+
+    /** A download or copy of a model file in progress (or its error). */
+    data class ModelTransfer(val path: String, val label: String, val done: Long = 0, val total: Long = -1, val error: String? = null, val finished: Boolean = false)
+    var modelTransfer by mutableStateOf<ModelTransfer?>(null); private set
+    private var transferJob: Job? = null
+
+    fun deviceRam(): Long = runCatching {
+        android.app.ActivityManager.MemoryInfo().also { getApplication<Application>().getSystemService(android.app.ActivityManager::class.java).getMemoryInfo(it) }.totalMem
+    }.getOrDefault(0)
+
+    /** Starts downloading a GGUF from [url] into the models folder; returns the path it will have. */
+    fun downloadModel(url: String, token: String?): String {
+        val dest = File(modelsDir(), app.switchboard.local.ModelFiles.nameFor(url))
+        runTransfer(dest, "Downloading ${dest.name}") { onP -> app.switchboard.local.ModelFiles.download(url, dest, token, onP) }
+        return dest.path
+    }
+
+    /** Copies a picked file into the models folder; returns the path it will have. */
+    fun copyModel(uri: android.net.Uri, name: String, size: Long): String {
+        val dest = File(modelsDir(), name.replace(Regex("[^A-Za-z0-9._-]"), "_"))
+        runTransfer(dest, "Copying ${dest.name}") { onP ->
+            val input = getApplication<Application>().contentResolver.openInputStream(uri) ?: throw ApiException("Couldn't open the file.")
+            app.switchboard.local.ModelFiles.copy(input, size, dest, onP)
+        }
+        return dest.path
+    }
+
+    private fun runTransfer(dest: File, label: String, work: suspend ((app.switchboard.local.ModelFiles.Progress) -> Unit) -> Unit) {
+        transferJob?.cancel()
+        modelTransfer = ModelTransfer(dest.path, label)
+        WorkService.start(getApplication(), label)
+        transferJob = viewModelScope.launch {
+            try {
+                work { pr -> viewModelScope.launch(Dispatchers.Main) { modelTransfer = modelTransfer?.takeIf { it.path == dest.path }?.copy(done = pr.done, total = pr.total) ?: modelTransfer } }
+                modelTransfer = ModelTransfer(dest.path, label, dest.length(), dest.length(), finished = true)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                modelTransfer = null; throw e
+            } catch (e: Exception) {
+                modelTransfer = modelTransfer?.copy(error = e.message ?: e.javaClass.simpleName)
+            } finally {
+                if (!streaming && installing.isEmpty()) WorkService.stop(getApplication())
+            }
+        }
+    }
+
+    fun cancelModelTransfer() { transferJob?.cancel(); transferJob = null; modelTransfer = null }
+
+    /** Picked file: its display name, size, and the real path when it can be found (to use it in place instead of copying). */
+    data class PickedFile(val uri: android.net.Uri, val name: String, val size: Long, val path: String?)
+
+    fun describePicked(uri: android.net.Uri): PickedFile {
+        val ctx = getApplication<Application>()
+        var name = "model.gguf"; var size = -1L
+        runCatching {
+            ctx.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME, android.provider.OpenableColumns.SIZE), null, null, null)?.use { c ->
+                if (c.moveToFirst()) { c.getString(0)?.let { name = it }; if (!c.isNull(1)) size = c.getLong(1) }
+            }
+        }
+        val ext = android.os.Environment.getExternalStorageDirectory().path
+        val id = runCatching { android.provider.DocumentsContract.getDocumentId(uri) }.getOrNull()
+        val path = when {
+            uri.scheme == "file" -> uri.path
+            id == null -> null
+            id.startsWith("raw:") -> id.removePrefix("raw:")
+            id.startsWith("primary:") -> "$ext/${id.removePrefix("primary:")}"
+            uri.authority == "com.android.providers.downloads.documents" -> "$ext/Download/$name"
+            Regex("^[0-9A-F]{4}-[0-9A-F]{4}:").containsMatchIn(id) -> "/storage/${id.substringBefore(':')}/${id.substringAfter(':')}"
+            else -> null
+        }
+        return PickedFile(uri, name, size, path)
+    }
+
+    /** All files access lets the engine read models where they are (Download etc.). */
+    fun hasAllFilesAccess(): Boolean = android.os.Build.VERSION.SDK_INT < 30 || android.os.Environment.isExternalStorageManager()
+
+    fun openAllFilesAccessSettings() {
+        val ctx = getApplication<Application>()
+        val i = if (android.os.Build.VERSION.SDK_INT >= 30)
+            android.content.Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, android.net.Uri.parse("package:${ctx.packageName}"))
+        else android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:${ctx.packageName}"))
+        runCatching { ctx.startActivity(i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) }
+    }
+
+    /** Loads a local provider's model now (the "Test" button). */
+    suspend fun loadLocal(p: Provider): Result<String> = runCatching {
+        app.switchboard.local.LocalEngine.ensure(p)
+        "Loaded and ready."
+    }
+
+    fun unloadLocal() = viewModelScope.launch { app.switchboard.local.LocalEngine.stop() }
+
+    /** Deletes a model file that lives in Switchboard's own models folder. */
+    fun deleteModelFile(path: String) {
+        val f = File(path)
+        if (f.parentFile?.canonicalPath == modelsDir().canonicalPath) { f.delete(); File("$path.part").delete() }
+    }
+
     suspend fun detectModels(p: Provider): Result<List<app.switchboard.net.ModelInfo>> = runCatching { client.listModelsDetailed(p, settings.unrestricted) }
 
     private fun updateSettings(f: (AppSettings) -> AppSettings) {

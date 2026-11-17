@@ -125,6 +125,7 @@ class MediaGen {
     }.getOrNull()
 
     private fun request(p: Provider, path: String, unrestricted: Boolean): Request.Builder {
+        if (p.local != null) throw ApiException("${p.name} is a local text model; it can't make images, audio or video.")
         val url = (p.baseUrl.trimEnd('/') + path).toHttpUrlOrNull() ?: throw ApiException("Invalid provider URL ${p.baseUrl}")
         if (!url.isHttps && !unrestricted && !isLocalHost(url.host)) throw ApiException("Plain http:// to the internet needs Unrestricted mode.")
         return Request.Builder().url(url).apply {

@@ -13,8 +13,8 @@ android {
         applicationId = "app.switchboard"
         minSdk = 26
         targetSdk = 35
-        versionCode = 28
-        versionName = "1.28"
+        versionCode = 29
+        versionName = "1.29"
     }
 
     buildTypes {
@@ -31,6 +31,8 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
+    // llama-server (local GGUF models) is run as a program, so it must be unpacked to the native library folder on install.
+    packaging { jniLibs { useLegacyPackaging = true } }
 }
 
 dependencies {

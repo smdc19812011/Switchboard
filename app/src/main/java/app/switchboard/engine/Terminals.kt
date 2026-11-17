@@ -29,7 +29,7 @@ class TermOutput(val id: String, val data: ByteArray, val end: Long)
  * so the window can redraw after being minimized, and gives the model a plain-text view. Pure JVM; tested against runner.py.
  */
 class TerminalHub(private val scope: CoroutineScope, private val onChange: (List<TermInfo>) -> Unit) {
-    private class Session(var info: TermInfo, val runner: Runner) {
+    private class Session(var info: TermInfo, val runner: Runner?) {
         val raw = ByteArrayOutputStream()
         var offset = 0L
         var modelSeen = 0
@@ -38,7 +38,12 @@ class TerminalHub(private val scope: CoroutineScope, private val onChange: (List
         @Volatile var lastOutputAt = 0L
     }
 
-    private val sessions = LinkedHashMap<String, Session>()
+    private val sessions = LinkedHashMap<String, Session>().apply {
+        // The Activity tab: commands the model runs (and their output) as they happen. Not a real terminal; no input.
+        put(ACTIVITY, Session(TermInfo(ACTIVITY, "Activity", "model activity"), null).also {
+            it.raw.write("\u001B[?25l\u001B[2mCommands the model runs show up here as they run.\u001B[0m\r\n".toByteArray())
+        })
+    }
     private val _output = MutableSharedFlow<TermOutput>(extraBufferCapacity = 256)
     val output: SharedFlow<TermOutput> = _output
 
@@ -57,10 +62,72 @@ class TerminalHub(private val scope: CoroutineScope, private val onChange: (List
         return s.info
     }
 
+    /** Adds output to a local (non-runner) tab such as [ACTIVITY]; bare newlines become CRLF for the terminal view. */
+    fun appendLocal(id: String, text: String) = appendLocal(id, text.replace("\r\n", "\n").replace("\n", "\r\n").toByteArray())
+
+    fun appendLocal(id: String, data: ByteArray) {
+        val s = sessions[id] ?: return
+        val end = synchronized(s.raw) {
+            s.raw.write(data); s.received += data.size
+            if (s.raw.size() > 1_000_000) { val keep = s.raw.toByteArray().let { it.copyOfRange(it.size - 800_000, it.size) }; s.raw.reset(); s.raw.write(keep) }
+            s.received
+        }
+        s.lastOutputAt = System.currentTimeMillis()
+        _output.tryEmit(TermOutput(id, data, end))
+    }
+
+    class CommandResult(val exitCode: Int?, val timedOut: Boolean, val output: String, val truncated: Boolean)
+
+    /**
+     * Runs a plain command on the runner (no input), showing its output live in the Activity tab, and returns the result
+     * for the model. Stopping the caller (or the timeout) kills the command.
+     */
+    suspend fun runLive(runner: Runner, command: String, cwd: String?, timeoutSec: Int): CommandResult {
+        appendLocal(ACTIVITY, "\r\n\u001B[1;36m$ ${command.replace("\n", "\n  ")}\u001B[0m\r\n".toByteArray())
+        val id = (runner.termStart(command, cwd, 0, 0, pipe = true)["id"] as? JsonPrimitive)?.content ?: throw ApiException("The runner didn't start the command.")
+        val out = ByteArrayOutputStream(); var dropped = false
+        var offset = 0L
+        val deadline = System.currentTimeMillis() + timeoutSec * 1000L
+        var finished = false
+        try {
+            while (true) {
+                val left = ((deadline - System.currentTimeMillis()) / 1000).toInt()
+                if (left <= 0) {
+                    runCatching { runner.termKill(id) }
+                    appendLocal(ACTIVITY, "\u001B[33m[timed out after ${timeoutSec}s; stopped]\u001B[0m\r\n".toByteArray())
+                    finished = true
+                    return CommandResult(null, true, tail(out), true)
+                }
+                val chunk = runner.termRead(id, offset, left.coerceAtMost(15))
+                if (chunk.data.isNotEmpty()) {
+                    appendLocal(ACTIVITY, chunk.data.decodeToString())
+                    out.write(chunk.data)
+                    if (out.size() > 400_000) { val b = out.toByteArray(); out.reset(); out.write(b, b.size - 200_000, 200_000); dropped = true }
+                }
+                offset = chunk.offset
+                if (!chunk.alive) {
+                    finished = true
+                    val color = if (chunk.exitCode == 0) "2" else "31"
+                    appendLocal(ACTIVITY, "\u001B[${color}m[exit ${chunk.exitCode}]\u001B[0m\r\n".toByteArray())
+                    val text = tail(out)
+                    return CommandResult(chunk.exitCode, false, text, dropped || out.toString(Charsets.UTF_8).length > text.length)
+                }
+            }
+        } finally {
+            if (!finished) {
+                kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { runCatching { runner.termKill(id) } }
+                appendLocal(ACTIVITY, "\u001B[33m[stopped]\u001B[0m\r\n".toByteArray())
+            }
+        }
+    }
+
+    private fun tail(out: ByteArrayOutputStream) = out.toString(Charsets.UTF_8).let { if (it.length > 20_000) it.takeLast(20_000) else it }
+
     private suspend fun pump(s: Session) {
+        val runner = s.runner ?: return
         var failures = 0
         while (scope.isActive) {
-            val chunk = try { s.runner.termRead(s.info.id, s.offset, 15).also { failures = 0 } } catch (e: kotlinx.coroutines.CancellationException) { throw e
+            val chunk = try { runner.termRead(s.info.id, s.offset, 15).also { failures = 0 } } catch (e: kotlinx.coroutines.CancellationException) { throw e
             } catch (e: Exception) {
                 if (++failures >= 5) { s.info = s.info.copy(alive = false); changed(); return }
                 delay(1000L * failures); continue
@@ -98,12 +165,13 @@ class TerminalHub(private val scope: CoroutineScope, private val onChange: (List
         synchronized(s.raw) { val b = s.raw.toByteArray(); (if (b.size > max) b.copyOfRange(b.size - max, b.size) else b) to s.received }
     } ?: (ByteArray(0) to 0L)
 
-    suspend fun send(id: String, data: ByteArray) { (sessions[id] ?: throw ApiException("No terminal '$id'.")).let { if (it.info.alive) it.runner.termWrite(id, data) } }
+    suspend fun send(id: String, data: ByteArray) { (sessions[id] ?: throw ApiException("No terminal '$id'.")).let { if (it.info.alive) it.runner?.termWrite(id, data) } }
     suspend fun resize(id: String, cols: Int, rows: Int) { sessions[id]?.takeIf { it.info.alive }?.runner?.termResize(id, cols, rows) }
     suspend fun stop(id: String) { sessions[id]?.takeIf { it.info.alive }?.runner?.termKill(id) }
 
     /** Removes a terminal from the list (stopping it first if it's still running). */
     suspend fun close(id: String) {
+        if (id == ACTIVITY) return
         runCatching { stop(id) }
         synchronized(sessions) { sessions.remove(id) }?.job?.cancel()
         changed()
@@ -169,6 +237,7 @@ class TerminalHub(private val scope: CoroutineScope, private val onChange: (List
             put("required", JsonArray(required.map { JsonPrimitive(it) }))
         }
 
+        const val ACTIVITY = "activity"
         const val START = "terminal_start"; const val SEND = "terminal_send"; const val READ = "terminal_read"; const val STOP = "terminal_stop"
         val names = setOf(START, SEND, READ, STOP)
         /** Talking to a terminal that's already running doesn't need approval; starting one does. */

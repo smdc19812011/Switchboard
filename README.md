@@ -57,10 +57,19 @@ The model loops on its own (call a tool, read the result, fix, retry, up to 40 s
 
 Programs that need someone at the keyboard (installers that ask questions, menus, full-screen text UIs such as htop or nano, REPLs, serial monitors, ssh, adb shell) run in real terminals on the Termux or computer runner (macOS/Linux/Termux; not Windows, not "This phone").
 - The model uses `terminal_start` (asks for approval like any command), then `terminal_send` to type, with keys like `{ENTER}`, `{UP}`, `{CTRL+C}`, and `terminal_read` to see the screen.
-- The terminal button at the top right of the chat shows how many terminals there are. The window starts minimized. Tap the button to open it.
+- The terminal button at the top right of the chat opens the terminal window (it starts minimized). It lights up while the model is running something and shows how many terminals there are.
+- The **Activity** tab shows every command the model runs (`run_command`) with its output, live, plus a line for each other tool it uses.
 - The window has a tab per terminal, **+** for your own shell, maximize, and minimize. Minimizing keeps the programs running. You can drag it by its title bar.
 - It uses xterm.js (MIT), so colors and cursor movement work. Tap the terminal to type. The extra-keys row has Ctrl, ^C, Esc, Tab, arrows, Home/End and PgUp/PgDn, plus text size.
 - On a computer, copy the new `runner.py` and restart it to get terminal support. Termux updates itself automatically.
+
+## Local models (GGUF on the phone)
+
+Settings > Add provider > **Local model (GGUF on this phone)** runs a model on the phone with the built-in [llama.cpp](https://github.com/ggml-org/llama.cpp) engine (MIT). It works offline, keeps everything on the phone and needs no API key.
+- **Get a model**: paste a `.gguf` link and tap Download. Hugging Face `…/blob/…` links are converted automatically, downloads resume, and gated models take an access token. Or tap **Choose file** for a `.gguf` already on the phone: it's used where it is if Switchboard has All files access, otherwise it's copied into the app.
+- **Settings**: context size (default 8192 tokens), CPU threads, and minutes idle before the model is unloaded to free memory. Use **Load now to test** to check that it loads.
+- How it works: the app starts llama.cpp's `llama-server` on 127.0.0.1 with a random key and talks to it like any OpenAI-compatible provider. So streaming, tool calls (via the model's own chat template), load balancing and fallbacks all work the same. Only one local model is loaded at a time.
+- It needs a 64-bit ARM phone. Small models (1–4B parameters, Q4_K_M) are the practical size, and a model needs a bit more free memory than its file size. The engine is rebuilt with `tools/build-llama-server.sh`.
 
 ## Build Android apps on the phone (no Termux)
 In **This phone** mode the model has a `build_apk` tool. It writes the app as a web app (`index.html` plus CSS, JS and assets) in the workspace, and Switchboard packages it into a real, signed APK that's attached to the chat with an **Install** button.
