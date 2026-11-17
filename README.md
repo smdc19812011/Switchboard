@@ -70,6 +70,12 @@ Settings > Add provider > **Local model (GGUF on this phone)** runs a model on t
 - **Get a model by link**: paste a `.gguf` link and tap Download. Hugging Face `…/blob/…` links are converted automatically, downloads resume, and gated models take an access token. Or tap **Choose file** for a `.gguf` already on the phone: it's used where it is if Switchboard has All files access, otherwise it's copied into the app.
 - **Settings**: context size (default 8192 tokens), CPU threads, and minutes idle before the model is unloaded to free memory. Use **Load now to test** to check that it loads.
 - How it works: the app starts llama.cpp's `llama-server` on 127.0.0.1 with a random key and talks to it like any OpenAI-compatible provider. So streaming, tool calls (via the model's own chat template), load balancing and fallbacks all work the same. Only one local model is loaded at a time.
+- **Bigger than memory (MoE models)**: Mixture of Experts models only use a few experts per token. Examples are Qwen3-30B-A3B (about 17 GB at Q4, 3B used per token) and gpt-oss-20b. The app reads a model's header, on the phone or with a 2 MB ranged request to Hugging Face, to spot MoE models. It marks them "bigger than memory: runs from storage" instead of "too big", up to about twice the phone's RAM. **Bigger than memory mode** turns on automatically for large files and tunes the engine for this:
+  - weights are memory-mapped and read from storage as needed, with no warm-up pass
+  - the conversation cache is 8-bit (it falls back automatically for models that can't use it)
+  - work buffers are smaller and the context defaults to 4096
+
+  It's slower, and dense models that don't fit are still flagged, because every token needs all of their weights.
 - It needs a 64-bit ARM phone. Small models (1–4B parameters, Q4_K_M) are the practical size, and a model needs a bit more free memory than its file size. The engine is rebuilt with `tools/build-llama-server.sh`.
 
 ## Build Android apps on the phone (no Termux)

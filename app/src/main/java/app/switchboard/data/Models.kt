@@ -47,6 +47,11 @@ data class LocalModel(
     val threads: Int = 0,
     /** Unload after this many idle minutes to free memory. */
     val keepMinutes: Int = 10,
+    /**
+     * "Bigger than memory" mode: weights are read from storage as needed instead of being loaded up front, with a
+     * compressed conversation cache and smaller work buffers, so models larger than RAM (especially MoE) can run.
+     */
+    val largeMode: Boolean = false,
 )
 
 /** How a toolbox entry is installed. AUTO decides from the source address. */

@@ -81,6 +81,13 @@ class LocalModelTest {
             val end = events.last() as StreamEvent.TurnEnd
             assertTrue(events.any { it is StreamEvent.TextDelta } || end.toolCalls.isNotEmpty())
             assertTrue(LocalEngine.isRunning && LocalEngine.status.value == "tiny")
+            // Bigger-than-memory mode restarts the engine with its options and still answers. This tiny model's head size (16)
+            // can't use the 8-bit cache, so this also covers the automatic retry with the normal cache.
+            val large = p.copy(local = p.local!!.copy(largeMode = true))
+            val e2 = ChatClient().stream(large, listOf(ChatMessage(role = Role.USER, text = "Hi")), RequestOptions(maxTokens = 8)).toList()
+            assertTrue(e2.last() is StreamEvent.TurnEnd)
+            assertEquals(listOf("-lm", "mmap", "--no-warmup", "-b", "512", "-ub", "128", "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0"), LocalEngine.largeModeArgs(true))
+            ChatClient().stream(p, listOf(ChatMessage(role = Role.USER, text = "Back")), RequestOptions(maxTokens = 4)).toList()
             // A second request reuses the loaded model.
             ChatClient().stream(p, listOf(ChatMessage(role = Role.USER, text = "Again")), RequestOptions(maxTokens = 4)).toList()
             // A wrong key is refused by the server, so other apps on the phone can't use the model.

@@ -30,7 +30,7 @@ object LocalEngine {
     @Volatile var stateDir: File? = null
     const val PORT = 8737
 
-    private data class Key(val path: String, val ctx: Int, val threads: Int, val apiKey: String)
+    private data class Key(val path: String, val ctx: Int, val threads: Int, val apiKey: String, val large: Boolean = false)
 
     private val mutex = Mutex()
     private var proc: Process? = null
@@ -63,24 +63,29 @@ object LocalEngine {
         if (lm.path.isBlank()) throw ApiException("${p.name}: no model file yet. Edit the provider to download a .gguf or choose one on the phone.")
         if (File(lm.path + ".part").exists() && !file.exists()) throw ApiException("${p.name}: the model is still downloading.")
         if (!file.canRead()) throw ApiException("${p.name}: can't read ${lm.path}. Choose the file again (or allow All files access).")
-        val key = Key(file.path, lm.contextSize.coerceIn(512, 262_144), lm.threads, p.apiKey)
+        val key = Key(file.path, lm.contextSize.coerceIn(512, 262_144), lm.threads, p.apiKey, lm.largeMode)
         keepMs = lm.keepMinutes.coerceAtLeast(1) * 60_000L
         touch()
         mutex.withLock {
             if (running == key && proc?.isAlive == true && healthy(key.apiKey)) return
             stopLocked()
-            start(bin, key, p.model.ifBlank { file.name })
+            try { start(bin, key, p.model.ifBlank { file.name }, quantCache = key.large) }
+            catch (e: ApiException) {
+                // Some models can't use the 8-bit conversation cache (head size not a multiple of 32): use the normal one.
+                if (key.large && "cache type" in recentLog(40)) start(bin, key, p.model.ifBlank { file.name }, quantCache = false) else throw e
+            }
         }
         touch()
     }
 
-    private suspend fun start(bin: File, key: Key, name: String) = withContext(Dispatchers.IO) {
+    private suspend fun start(bin: File, key: Key, name: String, quantCache: Boolean) = withContext(Dispatchers.IO) {
         killStale()
         synchronized(log) { log.clear() }
         _status.value = "Loading $name…"
         val args = mutableListOf(bin.path, "-m", key.path, "--host", "127.0.0.1", "--port", "$PORT", "-c", "${key.ctx}", "-np", "1",
             "--jinja", "--api-key", key.apiKey, "--no-webui", "-a", name)
         if (key.threads > 0) args += listOf("-t", "${key.threads}")
+        args += largeModeArgs(key.large, quantCache)
         val pb = ProcessBuilder(args).redirectErrorStream(true)
         bin.parentFile?.let { pb.environment()["LD_LIBRARY_PATH"] = it.path }
         val p = try { pb.start() } catch (e: Exception) { _status.value = null; throw ApiException("Couldn't start the local model engine: ${e.message}") }
@@ -94,7 +99,7 @@ object LocalEngine {
         while (true) {
             if (!p.isAlive) {
                 proc = null; running = null; _status.value = null
-                throw ApiException("The local model stopped while loading (exit ${p.exitValue()}). " + explain(recentLog(25)))
+                throw ApiException("The local model stopped while loading (exit ${p.exitValue()}). " + explain(recentLog(25), p.exitValue()))
             }
             if (healthy(key.apiKey)) break
             if (System.currentTimeMillis() > deadline) { stopLocked(); throw ApiException("The local model didn't finish loading within 15 minutes.") }
@@ -104,12 +109,20 @@ object LocalEngine {
         startIdleWatch()
     }
 
-    private fun explain(log: String): String {
+    /**
+     * Bigger-than-memory mode: map the file and let Android page weights in from storage as they're used (no warm-up pass
+     * that would touch every weight), 8-bit conversation cache (needs flash attention), and smaller work buffers.
+     */
+    fun largeModeArgs(large: Boolean, quantCache: Boolean = true): List<String> = if (!large) emptyList()
+        else listOf("-lm", "mmap", "--no-warmup", "-b", "512", "-ub", "128") + if (quantCache) listOf("-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0") else emptyList()
+
+    private fun explain(log: String, exit: Int = 0): String {
         val l = log.lowercase()
         val hint = when {
+            exit == 137 || exit == 9 -> "Android stopped the engine to free memory. Try a smaller model or context, turn on \"Bigger than memory\" mode, or close other apps."
             "failed to allocate" in l || "out of memory" in l || "cannot allocate" in l -> "The phone ran out of memory: try a smaller model (fewer parameters or a lower quant such as Q4_K_M) or a smaller context size."
             "unknown model architecture" in l -> "This llama.cpp build doesn't support that model's architecture yet."
-            "failed to load model" in l || "invalid magic" in l || "gguf" in l && "error" in l -> "The file doesn't look like a complete, valid GGUF model (an unfinished download?)."
+            "invalid magic" in l || "failed to read magic" in l || ("failed to load model" in l && "create context" !in l) -> "The file doesn't look like a complete, valid GGUF model (an unfinished download?)."
             else -> ""
         }
         return (hint + "\n" + log.lines().filter { it.isNotBlank() }.takeLast(6).joinToString("\n")).trim()

@@ -35,6 +35,21 @@ class HfSearch(private val base: String = "https://huggingface.co") {
         }
     }
 
+    /** Reads the model header from the start of a remote .gguf (first 2 MB, ranged request) to see e.g. whether it's MoE. */
+    suspend fun peek(url: String, token: String? = null): GgufInfo = withContext(Dispatchers.IO) {
+        val rb = Request.Builder().url(url).header("User-Agent", "Switchboard").header("Range", "bytes=0-2097151")
+        token?.takeIf { it.isNotBlank() }?.let { rb.header("Authorization", "Bearer $it") }
+        http.newCall(rb.build()).execute().use { r ->
+            if (!r.isSuccessful) throw ApiException("HTTP ${r.code}")
+            // Never read more than 2 MB, even from a server that ignores Range.
+            GgufInfo.read(object : java.io.FilterInputStream(r.body!!.byteStream()) {
+                var left = 2L * 1024 * 1024
+                override fun read(): Int = if (left <= 0) -1 else super.read().also { if (it >= 0) left-- }
+                override fun read(b: ByteArray, off: Int, len: Int): Int = if (left <= 0) -1 else super.read(b, off, minOf(len.toLong(), left).toInt()).also { if (it > 0) left -= it }
+            })
+        }
+    }
+
     /** Most-downloaded GGUF repos matching [query]. */
     suspend fun search(query: String, token: String? = null, limit: Int = 30): List<Repo> {
         val url = "$base/api/models".toHttpUrl().newBuilder()

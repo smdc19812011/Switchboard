@@ -63,6 +63,8 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
     var ctx by remember { mutableStateOf(lm0.contextSize.toString()) }
     var threads by remember { mutableStateOf(if (lm0.threads > 0) lm0.threads.toString() else "") }
     var keep by remember { mutableStateOf(lm0.keepMinutes.toString()) }
+    var large by remember { mutableStateOf(lm0.largeMode) }
+    var info by remember { mutableStateOf<app.switchboard.local.GgufInfo?>(null) }
     var picked by remember { mutableStateOf<ChatViewModel.PickedFile?>(null) }
     var testNote by remember { mutableStateOf<String?>(null) }
     var refresh by remember { mutableStateOf(0) } // re-check file access after returning from settings
@@ -70,12 +72,16 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
     val status by LocalEngine.status.collectAsState()
     val transfer = vm.modelTransfer?.takeIf { it.path == path }
 
+    fun chose(size: Long) {
+        val want = app.switchboard.local.Fit.wantsLargeMode(size, vm.deviceRam())
+        if (want && !large) { large = true; if ((ctx.toIntOrNull() ?: 0) > 4096) ctx = "4096" }
+    }
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
         val f = vm.describePicked(uri)
         if (!f.name.endsWith(".gguf", true)) { testNote = "${f.name} isn't a .gguf file."; return@rememberLauncherForActivityResult }
         // Use it where it is when the engine can read it; otherwise offer to copy it (or to allow All files access).
-        if (f.path != null && File(f.path).canRead()) { path = f.path; source = ""; picked = null } else picked = f
+        if (f.path != null && File(f.path).canRead()) { path = f.path; source = ""; picked = null; chose(f.size) } else picked = f
     }
     // Back from the All files access screen: the picked file may be readable in place now.
     val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current
@@ -83,9 +89,14 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
         val obs = androidx.lifecycle.LifecycleEventObserver { _, e -> if (e == androidx.lifecycle.Lifecycle.Event.ON_RESUME) refresh++ }
         lifecycle.lifecycle.addObserver(obs); onDispose { lifecycle.lifecycle.removeObserver(obs) }
     }
-    LaunchedEffect(refresh) { picked?.path?.let { if (File(it).canRead()) { path = it; source = ""; picked = null } } }
+    LaunchedEffect(refresh) { picked?.let { pf -> pf.path?.let { if (File(it).canRead()) { path = it; source = ""; picked = null; chose(pf.size) } } } }
 
     val file = File(path)
+    val fileDone = file.exists() && transfer?.let { it.finished || it.error != null } != false
+    // Read the model's header once the file is there: is it Mixture of Experts? Big files get "Bigger than memory" mode.
+    LaunchedEffect(path, fileDone) {
+        info = if (fileDone) kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { runCatching { file.inputStream().use { app.switchboard.local.GgufInfo.read(it) } }.getOrNull() } else null
+    }
     val fileOk = path.isNotBlank() && (file.exists() || transfer != null)
     val ram = vm.deviceRam()
     fun draft(): Provider {
@@ -94,7 +105,7 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
             apiKey = initial.apiKey.ifBlank { java.util.UUID.randomUUID().toString().replace("-", "") },
             model = model, chatModels = listOf(model), imageModels = emptyList(), audioModels = emptyList(), videoModels = emptyList(),
             local = LocalModel(path = path, source = source, contextSize = ctx.toIntOrNull()?.coerceIn(512, 262_144) ?: 8192,
-                threads = threads.toIntOrNull()?.coerceIn(0, 32) ?: 0, keepMinutes = keep.toIntOrNull()?.coerceIn(1, 1440) ?: 10))
+                threads = threads.toIntOrNull()?.coerceIn(0, 32) ?: 0, keepMinutes = keep.toIntOrNull()?.coerceIn(1, 1440) ?: 10, largeMode = large))
     }
 
     AlertDialog(onDismissRequest = onDismiss, title = { Text(if (isNew) "Add local model" else "Edit local model") }, text = {
@@ -108,11 +119,25 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
             Text("Model file", style = MaterialTheme.typography.titleSmall)
             if (path.isNotBlank()) {
                 Text(file.name, style = MaterialTheme.typography.bodyMedium)
+                val moe = info?.isMoe ?: app.switchboard.local.GgufInfo.looksMoe(file.name)
+                val fit = if (file.exists()) app.switchboard.local.Fit.of(file.length(), ram, moe) else app.switchboard.local.Fit.FITS
                 Text(buildString {
                     append(if (file.exists()) ModelFiles.human(file.length()) else if (transfer != null) "Not finished yet" else "File missing")
-                    if (ram > 0 && file.exists() && file.length() > ram * 0.7) append(" · larger than this phone's memory can comfortably hold (${ModelFiles.human(ram)} RAM)")
+                    info?.let { i ->
+                        i.architecture?.let { append(" · $it") }
+                        if (i.isMoe) append(" · Mixture of Experts (${i.expertUsed} of ${i.expertCount} experts per token)")
+                        if (i.contextLength > 0) append(" · trained for ${i.contextLength / 1024}k context")
+                    }
+                    when (fit) {
+                        app.switchboard.local.Fit.BIG_MOE -> append("\nBigger than this phone's memory (${ModelFiles.human(ram)} RAM), but as a MoE model it can run from storage: slower, and the first replies warm it up.")
+                        app.switchboard.local.Fit.TOO_BIG -> append("\nToo big for this phone's memory (${ModelFiles.human(ram)} RAM)" + if (moe) "." else ": every token uses all of a dense model's weights, so it would crawl reading from storage.")
+                        else -> {}
+                    }
                     append("\n"); append(path)
-                }, style = MaterialTheme.typography.bodySmall, color = if (file.exists() && ram > 0 && file.length() > ram * 0.7) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                }, style = MaterialTheme.typography.bodySmall, color = when (fit) {
+                    app.switchboard.local.Fit.TOO_BIG -> MaterialTheme.colorScheme.error
+                    app.switchboard.local.Fit.BIG_MOE -> MaterialTheme.colorScheme.tertiary
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant })
             } else Text("None yet. Download one by link or choose a .gguf already on the phone.", style = MaterialTheme.typography.bodySmall)
 
             transfer?.let { t ->
@@ -127,7 +152,7 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
             }
 
             HfSearchSection(vm, token, ram, busy = transfer?.let { !it.finished && it.error == null } == true) { f ->
-                path = vm.downloadModelParts(f.urls, f.size, token); source = f.urls.first(); link = f.urls.first()
+                path = vm.downloadModelParts(f.urls, f.size, token); source = f.urls.first(); link = f.urls.first(); chose(f.size)
                 if (isNew && (name.isBlank() || name == "Local model")) name = f.name.removeSuffix(".gguf").substringBefore("-00001-of-")
             }
             Text("Or paste a link", style = MaterialTheme.typography.labelMedium)
@@ -146,7 +171,7 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
             picked?.let { f ->
                 Text("${f.name}${if (f.size > 0) " (${ModelFiles.human(f.size)})" else ""}: Switchboard can't read it where it is yet.", style = MaterialTheme.typography.bodySmall)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilledTonalButton(onClick = { path = vm.copyModel(f.uri, f.name, f.size); source = ""; picked = null }) { Text("Copy into app") }
+                    FilledTonalButton(onClick = { path = vm.copyModel(f.uri, f.name, f.size); source = ""; picked = null; chose(f.size) }) { Text("Copy into app") }
                     if (f.path != null && !vm.hasAllFilesAccess()) OutlinedButton(onClick = { vm.openAllFilesAccessSettings() }) { Text("Allow All files access") }
                 }
                 Text(if (f.path != null) "Copying uses another ${ModelFiles.human(f.size)} of storage. Allowing All files access uses the file where it is instead (come back here after allowing)."
@@ -163,6 +188,16 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
                 OutlinedTextField(keep, { keep = it.filter(Char::isDigit).take(4) }, label = { Text("Unload after") }, singleLine = true,
                     supportingText = { Text("idle min") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
             }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Bigger than memory mode", style = MaterialTheme.typography.bodyMedium)
+                    Text("For models larger than this phone's RAM, mainly Mixture of Experts (MoE) models such as Qwen3-30B-A3B or gpt-oss-20b. Weights are read from storage as they're needed instead of loaded up front, the conversation cache is compressed to 8-bit, and work buffers are smaller. Slower, but lets 15–20 GB MoE models run. Use a context of 4096 or less.",
+                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                androidx.compose.material3.Switch(checked = large, onCheckedChange = { large = it })
+            }
+            val free = remember(path, transfer?.finished) { runCatching { android.os.StatFs(vm.modelsDir().path).availableBytes }.getOrDefault(-1L) }
+            if (free >= 0) Text("Free storage: ${ModelFiles.human(free)}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("More context remembers more of the chat but uses more memory. With tools on, the tool descriptions alone take a few thousand tokens, so keep at least 8192 or turn tools off for this chat.",
                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -229,18 +264,35 @@ private fun HfSearchSection(vm: ChatViewModel, token: String, ram: Long, busy: B
                 color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 24.dp))
         }
         if (isOpen) files?.let { fs ->
-            val rec = app.switchboard.local.HfSearch.recommended(fs.filter { ram <= 0 || it.size < ram * 0.7 })
+            // Peek at the first file's header to see whether the model is MoE (can run bigger than RAM); fall back to the name.
+            var peek by remember(r.id) { mutableStateOf<app.switchboard.local.GgufInfo?>(null) }
+            LaunchedEffect(r.id) { fs.firstOrNull()?.let { f -> peek = runCatching { vm.hf.peek(f.urls.first(), token) }.getOrNull() } }
+            val moe = peek?.takeIf { it.architecture != null }?.isMoe ?: (app.switchboard.local.GgufInfo.looksMoe(r.id) || fs.any { app.switchboard.local.GgufInfo.looksMoe(it.name) })
+            fun fitOf(f: app.switchboard.local.HfSearch.GgufFile) = app.switchboard.local.Fit.of(f.size, ram, moe)
+            val free = remember { runCatching { android.os.StatFs(vm.modelsDir().path).availableBytes }.getOrDefault(-1L) }
+            Text(buildString {
+                peek?.architecture?.let { append("$it · ") }
+                if (moe) append("Mixture of Experts" + (peek?.takeIf { it.isMoe }?.let { " (${it.expertUsed} of ${it.expertCount} experts per token)" } ?: "") + ": can run bigger than memory, slower")
+                else append("Dense model: needs to fit in memory")
+            }, style = MaterialTheme.typography.labelSmall, color = if (moe) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 24.dp))
+            val rec = app.switchboard.local.HfSearch.recommended(fs.filter { fitOf(it) == app.switchboard.local.Fit.FITS }) ?: app.switchboard.local.HfSearch.recommended(fs.filter { fitOf(it) != app.switchboard.local.Fit.TOO_BIG })
             fs.forEach { f ->
-                val tooBig = ram > 0 && f.size > ram * 0.7
+                val fit = fitOf(f)
+                val tooBig = fit == app.switchboard.local.Fit.TOO_BIG
+                val noRoom = free in 0 until f.size
                 Row(Modifier.fillMaxWidth().padding(start = 24.dp).clickable(enabled = !busy) { onDownload(f) }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Download, "Download ${f.name}", tint = if (tooBig) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                    Icon(Icons.Default.Download, "Download ${f.name}", tint = if (tooBig || noRoom) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.size(8.dp))
                     Column(Modifier.weight(1f)) {
                         Text(f.name, style = MaterialTheme.typography.bodySmall)
                         Text(listOfNotNull(f.quant.ifBlank { null }, ModelFiles.human(f.size), "${f.parts} parts".takeIf { f.parts > 1 },
-                            "recommended".takeIf { f == rec }, "too big for this phone".takeIf { tooBig }).joinToString(" · "),
+                            "recommended".takeIf { f == rec },
+                            "bigger than memory: runs from storage".takeIf { fit == app.switchboard.local.Fit.BIG_MOE },
+                            "too big for this phone".takeIf { tooBig }, "not enough free storage".takeIf { noRoom }).joinToString(" · "),
                             style = MaterialTheme.typography.labelSmall,
-                            color = when { tooBig -> MaterialTheme.colorScheme.error; f == rec -> MaterialTheme.colorScheme.primary; else -> MaterialTheme.colorScheme.onSurfaceVariant })
+                            color = when { tooBig || noRoom -> MaterialTheme.colorScheme.error; fit == app.switchboard.local.Fit.BIG_MOE -> MaterialTheme.colorScheme.tertiary
+                                f == rec -> MaterialTheme.colorScheme.primary; else -> MaterialTheme.colorScheme.onSurfaceVariant })
                     }
                 }
             }
