@@ -26,6 +26,7 @@ import app.switchboard.WorkService
 import app.switchboard.net.RequestOptions
 import app.switchboard.net.Runner
 import app.switchboard.net.ApiException
+import app.switchboard.local.HfSearch
 import app.switchboard.net.PhoneHost
 import app.switchboard.net.Termux
 import app.switchboard.net.ToolHost
@@ -1475,6 +1476,25 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         runTransfer(dest, "Downloading ${dest.name}") { onP -> app.switchboard.local.ModelFiles.download(url, dest, token, onP) }
         return dest.path
     }
+
+    /** Downloads every part of a Hugging Face model file (split models have several); returns the first part's path, which llama.cpp loads. */
+    fun downloadModelParts(urls: List<String>, total: Long, token: String?): String {
+        val dests = urls.map { File(modelsDir(), app.switchboard.local.ModelFiles.nameFor(it)) }
+        val label = "Downloading ${dests.first().name}" + if (urls.size > 1) " (${urls.size} parts)" else ""
+        runTransfer(dests.first(), label) { onP ->
+            var before = 0L
+            urls.zip(dests).forEach { (u, d) ->
+                if (d.exists()) { before += d.length(); return@forEach }
+                app.switchboard.local.ModelFiles.download(u, d, token) { pr ->
+                    onP(app.switchboard.local.ModelFiles.Progress(before + pr.done, if (total > 0) total else -1))
+                }
+                before += d.length()
+            }
+        }
+        return dests.first().path
+    }
+
+    val hf = HfSearch()
 
     /** Copies a picked file into the models folder; returns the path it will have. */
     fun copyModel(uri: android.net.Uri, name: String, size: Long): String {

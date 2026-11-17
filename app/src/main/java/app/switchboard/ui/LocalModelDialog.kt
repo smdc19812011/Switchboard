@@ -14,6 +14,11 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
@@ -121,6 +126,11 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
                 if (t.error != null && t.label.startsWith("Downloading")) TextButton(onClick = { path = vm.downloadModel(link, token) }) { Text("Try again (resumes)") }
             }
 
+            HfSearchSection(vm, token, ram, busy = transfer?.let { !it.finished && it.error == null } == true) { f ->
+                path = vm.downloadModelParts(f.urls, f.size, token); source = f.urls.first(); link = f.urls.first()
+                if (isNew && (name.isBlank() || name == "Local model")) name = f.name.removeSuffix(".gguf").substringBefore("-00001-of-")
+            }
+            Text("Or paste a link", style = MaterialTheme.typography.labelMedium)
             OutlinedTextField(link, { link = it.trim() }, label = { Text("Download link (.gguf)") }, singleLine = true,
                 placeholder = { Text("https://huggingface.co/…/model-Q4_K_M.gguf") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth())
@@ -171,4 +181,75 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
     }, confirmButton = {
         TextButton(enabled = fileOk && name.isNotBlank(), onClick = { onSave(draft()) }) { Text("Save") }
     }, dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } })
+}
+
+/** Search Hugging Face for GGUF models, open one to see its files (quantizations) and download the chosen one. */
+@Composable
+private fun HfSearchSection(vm: ChatViewModel, token: String, ram: Long, busy: Boolean, onDownload: (app.switchboard.local.HfSearch.GgufFile) -> Unit) {
+    var query by remember { mutableStateOf("") }
+    var repos by remember { mutableStateOf<List<app.switchboard.local.HfSearch.Repo>?>(null) }
+    var open by remember { mutableStateOf<String?>(null) }
+    var files by remember { mutableStateOf<List<app.switchboard.local.HfSearch.GgufFile>?>(null) }
+    var note by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    fun search() {
+        note = "Searching…"; repos = null; open = null; files = null
+        scope.launch {
+            runCatching { vm.hf.search(query, token) }
+                .onSuccess { repos = it; note = if (it.isEmpty()) "No GGUF models found for \"$query\"." else null }
+                .onFailure { note = "Search failed: ${it.message}" }
+        }
+    }
+    Text("Search Hugging Face", style = MaterialTheme.typography.labelMedium)
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(query, { query = it }, placeholder = { Text("e.g. qwen 3b, llama 1b, gemma") }, singleLine = true, modifier = Modifier.weight(1f),
+            keyboardOptions = KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Search),
+            keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSearch = { if (query.isNotBlank()) search() }))
+        FilledTonalButton(enabled = query.isNotBlank(), onClick = { search() }) { Icon(Icons.Default.Search, "Search") }
+    }
+    note?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = if (it.startsWith("Search failed")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant) }
+    repos?.forEach { r ->
+        val isOpen = open == r.id
+        Column(Modifier.fillMaxWidth().clickable {
+            if (isOpen) { open = null; files = null } else {
+                open = r.id; files = null; note = "Loading files of ${r.id}…"
+                scope.launch {
+                    runCatching { vm.hf.files(r.id, token) }
+                        .onSuccess { if (open == r.id) { files = it; note = if (it.isEmpty()) "${r.id} has no .gguf files." else null } }
+                        .onFailure { note = "Couldn't list files: ${it.message}" + if (r.gated) " (gated model: accept its license on huggingface.co and enter an access token)" else "" }
+                }
+            }
+        }.padding(vertical = 6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(if (isOpen) Icons.Default.ExpandLess else Icons.Default.ExpandMore, null, Modifier.size(18.dp))
+                Spacer(Modifier.size(6.dp))
+                Text(r.id, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+            }
+            Text("↓ ${compact(r.downloads)}  ♥ ${compact(r.likes)}" + if (r.gated) "  · gated" else "", style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 24.dp))
+        }
+        if (isOpen) files?.let { fs ->
+            val rec = app.switchboard.local.HfSearch.recommended(fs.filter { ram <= 0 || it.size < ram * 0.7 })
+            fs.forEach { f ->
+                val tooBig = ram > 0 && f.size > ram * 0.7
+                Row(Modifier.fillMaxWidth().padding(start = 24.dp).clickable(enabled = !busy) { onDownload(f) }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Download, "Download ${f.name}", tint = if (tooBig) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.size(8.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(f.name, style = MaterialTheme.typography.bodySmall)
+                        Text(listOfNotNull(f.quant.ifBlank { null }, ModelFiles.human(f.size), "${f.parts} parts".takeIf { f.parts > 1 },
+                            "recommended".takeIf { f == rec }, "too big for this phone".takeIf { tooBig }).joinToString(" · "),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = when { tooBig -> MaterialTheme.colorScheme.error; f == rec -> MaterialTheme.colorScheme.primary; else -> MaterialTheme.colorScheme.onSurfaceVariant })
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun compact(n: Long): String = when {
+    n >= 1_000_000 -> "%.1fM".format(n / 1e6)
+    n >= 1_000 -> "%.1fk".format(n / 1e3)
+    else -> "$n"
 }
