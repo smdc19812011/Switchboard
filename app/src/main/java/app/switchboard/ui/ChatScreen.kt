@@ -171,7 +171,7 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
                 "$dayLeft/${lim.perDay} remaining 24hr".takeIf { lim.perDay > 0 },
             )
             // With several providers taking turns, the counter is for the one answering next.
-            val footer = parts.takeIf { it.isNotEmpty() }?.joinToString("   ")?.let { if (vm.rotation.size > 1 && chatProvider != null) "${chatProvider.name}:  $it" else it }
+            val footer = parts.takeIf { it.isNotEmpty() }?.let { if (vm.rotation.size > 1 && chatProvider != null) listOf("${chatProvider.name}:") + it else it }
             val exhausted = lim != null && ((lim.perMinute > 0 && minLeft == 0) || (lim.perDay > 0 && dayLeft == 0))
             Composer(enabled = provider != null, streaming = vm.streaming, onSend = send, onStop = vm::stop, footer = footer, footerWarn = exhausted,
                 pending = vm.pendingAttachments, attaching = vm.attaching, onAttach = vm::addAttachments, onRemove = vm::removePending)
@@ -422,7 +422,7 @@ private val OCTOPUS = listOf(
 )
 
 @Composable
-private fun Composer(enabled: Boolean, streaming: Boolean, onSend: (String, Boolean) -> Unit, onStop: () -> Unit, footer: String? = null, footerWarn: Boolean = false,
+private fun Composer(enabled: Boolean, streaming: Boolean, onSend: (String, Boolean) -> Unit, onStop: () -> Unit, footer: List<String>? = null, footerWarn: Boolean = false,
                      pending: List<app.switchboard.data.Attachment> = emptyList(), attaching: Boolean = false,
                      onAttach: (List<android.net.Uri>) -> Unit = {}, onRemove: (app.switchboard.data.Attachment) -> Unit = {}) {
     var text by rememberSaveable { mutableStateOf("") }
@@ -481,11 +481,19 @@ private fun Composer(enabled: Boolean, streaming: Boolean, onSend: (String, Bool
                 ) { Icon(Icons.Default.ArrowUpward, "Send") }
             }
         }
-        footer?.let {
-            Text(it, style = MaterialTheme.typography.labelSmall,
-                color = if (footerWarn) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.align(Alignment.End).padding(end = 16.dp, bottom = 8.dp)
-                    .semantics { contentDescription = "Requests remaining: $it" })
+        // Each piece stays on one line and the pieces line up on the right, wrapping as whole pieces on narrow screens.
+        footer?.let { pieces ->
+            @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+            androidx.compose.foundation.layout.FlowRow(
+                Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 8.dp)
+                    .semantics(mergeDescendants = true) { contentDescription = "Requests remaining: ${pieces.joinToString(" ")}" },
+                horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End),
+            ) {
+                pieces.forEach { piece ->
+                    Text(piece, style = MaterialTheme.typography.labelSmall, maxLines = 1, softWrap = false,
+                        color = if (footerWarn) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
         }
       }
     }
