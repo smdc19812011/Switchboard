@@ -214,6 +214,7 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
                 }
                 androidx.compose.material3.Switch(checked = large, onCheckedChange = { large = it })
             }
+            MemoryPanel(vm, need = if (file.exists()) file.length() else 0L, large = large)
             val free = remember(path, transfer?.finished) { runCatching { android.os.StatFs(vm.modelsDir().path).availableBytes }.getOrDefault(-1L) }
             if (free >= 0) Text("Free storage: ${ModelFiles.human(free)}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("More context remembers more of the chat but uses more memory. With tools on, the tool descriptions alone take a few thousand tokens, so keep at least 8192 or turn tools off for this chat.",
@@ -324,4 +325,38 @@ private fun compact(n: Long): String = when {
     n >= 1_000_000 -> "%.1fM".format(n / 1e6)
     n >= 1_000 -> "%.1fk".format(n / 1e3)
     else -> "$n"
+}
+
+/**
+ * Live memory readout (free RAM and RAM Plus / swap), whether the chosen model fits right now, and a shortcut to
+ * Samsung's RAM Plus setting, which lets Android park other apps on storage to free RAM for the model.
+ */
+@Composable
+private fun MemoryPanel(vm: ChatViewModel, need: Long, large: Boolean) {
+    var mem by remember { mutableStateOf(app.switchboard.local.MemoryStatus.read()) }
+    var opened by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) { while (true) { kotlinx.coroutines.delay(2000); mem = app.switchboard.local.MemoryStatus.read() } }
+    val m = mem ?: return
+    Text("Memory now", style = MaterialTheme.typography.titleSmall)
+    Text("${ModelFiles.human(m.freeRam)} free of ${ModelFiles.human(m.totalRam)} RAM" +
+        if (m.swapTotal > 0) " · ${if (vm.isSamsung) "RAM Plus" else "virtual memory"} ${ModelFiles.human(m.swapTotal)} (${ModelFiles.human(m.swapUsed)} in use)" else "",
+        style = MaterialTheme.typography.bodySmall)
+    if (need > 0) {
+        // A model in memory needs a bit more than its file; in bigger-than-memory mode it only needs room for its working part.
+        val fits = if (large) m.freeRam > minOf(need, 3L shl 30) else m.freeRam > need * 1.1
+        Text(when {
+            fits && !large -> "Enough free memory for this model right now."
+            fits -> "Enough free memory to start; the rest of the model is read from storage as needed."
+            else -> "Not enough free memory right now (${ModelFiles.human(m.freeRam)} free). Close other apps" +
+                (if (vm.isSamsung) ", or turn up RAM Plus so Android can park them on storage" else "") + ", or pick a smaller file."
+        }, style = MaterialTheme.typography.labelSmall, color = if (fits) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error)
+    }
+    if (vm.isSamsung) {
+        Text("RAM Plus is Samsung's virtual memory: it moves other apps' memory to storage, so more real RAM is left for the model. It doesn't make a model bigger than RAM run faster. " +
+            "Set it to the largest size (Settings > Battery and device care > Memory > RAM Plus); the phone restarts to apply it.",
+            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        OutlinedButton(onClick = { opened = vm.openRamPlus() }) { Text("Open RAM Plus settings") }
+        opened?.let { if (it != "RAM Plus") Text(if (it.isEmpty()) "Couldn't open it here: go to Settings > Battery and device care > Memory > RAM Plus."
+            else "Opened $it: tap Memory, then RAM Plus.", style = MaterialTheme.typography.labelSmall) }
+    }
 }

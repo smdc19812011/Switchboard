@@ -15,6 +15,7 @@ class App : Application() {
         LocalEngine.binary = File(applicationInfo.nativeLibraryDir, "libllama-server.so").takeIf { it.exists() }
         LocalEngine.stateDir = filesDir
         LocalEngine.launcher = ServiceLauncher(this)
+        LocalEngine.isSamsung = android.os.Build.MANUFACTURER.equals("samsung", ignoreCase = true)
         // Model downloads keep a foreground service (progress notification, wake and Wi-Fi locks) while they run.
         val ctx = this
         ModelDownloads.hooks = object : ModelDownloads.Hooks {

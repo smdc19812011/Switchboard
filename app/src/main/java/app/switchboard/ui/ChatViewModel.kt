@@ -1544,6 +1544,31 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         runCatching { ctx.startActivity(i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) }
     }
 
+    val isSamsung: Boolean get() = android.os.Build.MANUFACTURER.equals("samsung", ignoreCase = true)
+
+    /**
+     * Opens Samsung's RAM Plus screen (Device care > Memory > RAM Plus). Apps can't change RAM Plus themselves, so this
+     * tries the known screens and falls back to Device care, then Settings. Returns what was opened, for the hint.
+     */
+    fun openRamPlus(): String {
+        val ctx = getApplication<Application>()
+        val lool = "com.samsung.android.lool"
+        val tries = listOf(
+            android.content.Intent().setClassName(lool, "com.samsung.android.sm.ram.ui.RamPlusActivity") to "RAM Plus",
+            android.content.Intent().setClassName(lool, "com.samsung.android.sm.ui.ram.RamPlusActivity") to "RAM Plus",
+            android.content.Intent().setClassName(lool, "com.samsung.android.sm.ram.ui.RamActivity") to "Memory",
+            android.content.Intent().setClassName(lool, "com.samsung.android.sm.ui.ram.RamActivity") to "Memory",
+            ctx.packageManager.getLaunchIntentForPackage(lool) to "Device care",
+            android.content.Intent(android.provider.Settings.ACTION_SETTINGS) to "Settings",
+        )
+        for ((intent, label) in tries) {
+            if (intent == null) continue
+            val ok = runCatching { ctx.startActivity(intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)) }.isSuccess
+            if (ok) return label
+        }
+        return ""
+    }
+
     /** Loads a local provider's model now (the "Test" button). */
     suspend fun loadLocal(p: Provider): Result<String> = runCatching {
         app.switchboard.local.LocalEngine.ensure(p)

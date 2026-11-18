@@ -47,7 +47,8 @@ object CrashReport {
                 report = when (info.reason) {
                     ApplicationExitInfo.REASON_LOW_MEMORY -> Report("Android closed Switchboard to free memory",
                         "The phone ran out of memory. This usually happens while a local model loads or answers, when the model plus its context needs more memory than is free. " +
-                            "Try \"Bigger than memory\" mode, a smaller context (4096), a smaller file (e.g. Q4_K_M or fewer parameters), or closing other apps.", base)
+                            "Try \"Bigger than memory\" mode, a smaller context (4096), a smaller file (e.g. Q4_K_M or fewer parameters), or closing other apps." +
+                            (if (Build.MANUFACTURER.equals("samsung", true)) " Setting RAM Plus to its largest size (Settings > Battery and device care > Memory > RAM Plus) also frees RAM by parking other apps on storage." else ""), base)
                     ApplicationExitInfo.REASON_CRASH, ApplicationExitInfo.REASON_CRASH_NATIVE -> Report("Switchboard crashed",
                         "Sorry about that. Tap Copy details and send them over so it can be fixed.", base + "\n\n" + (crash ?: "(no stack trace saved)"))
                     ApplicationExitInfo.REASON_ANR -> Report("Switchboard stopped responding",

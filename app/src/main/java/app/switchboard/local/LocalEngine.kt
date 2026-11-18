@@ -203,11 +203,19 @@ object LocalEngine {
     fun largeModeArgs(large: Boolean, quantCache: Boolean = true): List<String> = if (!large) emptyList()
         else listOf("-lm", "mmap", "--no-warmup", "-b", "512", "-ub", "128") + if (quantCache) listOf("-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0") else emptyList()
 
+    /** Current free memory, plus the RAM Plus tip on Samsung phones (the app sets [isSamsung]). */
+    @Volatile var isSamsung = false
+    private fun memoryTip(): String {
+        val m = MemoryStatus.read()
+        val free = m?.let { " (${ModelFiles.human(it.freeRam)} of ${ModelFiles.human(it.totalRam)} free now)" } ?: ""
+        return (if (isSamsung) "; on this phone, also set RAM Plus to its largest size (Settings > Battery and device care > Memory > RAM Plus) so Android can park other apps on storage" else "") + "$free."
+    }
+
     private fun explain(log: String, exit: Int = 0): String {
         val l = log.lowercase()
         val hint = when {
-            exit == 137 || exit == 9 -> "Android stopped the engine to free memory. Try a smaller model or context, turn on \"Bigger than memory\" mode, or close other apps."
-            "failed to allocate" in l || "out of memory" in l || "cannot allocate" in l -> "The phone ran out of memory: try a smaller model (fewer parameters or a lower quant such as Q4_K_M) or a smaller context size."
+            exit == 137 || exit == 9 -> "Android stopped the engine to free memory. Try a smaller model or context, turn on \"Bigger than memory\" mode, or close other apps" + memoryTip()
+            "failed to allocate" in l || "out of memory" in l || "cannot allocate" in l -> "The phone ran out of memory: try a smaller model (fewer parameters or a lower quant such as Q4_K_M) or a smaller context size" + memoryTip()
             "unknown model architecture" in l -> "This llama.cpp build doesn't support that model's architecture yet."
             "invalid magic" in l || "failed to read magic" in l || ("failed to load model" in l && "create context" !in l) -> "The file doesn't look like a complete, valid GGUF model (an unfinished download?)."
             else -> ""
