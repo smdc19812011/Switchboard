@@ -35,6 +35,16 @@ data class Provider(
     val chatOrder: List<String> get() = (listOf(model) + chatModels).filter { it.isNotBlank() }.distinct()
 }
 
+/** Open Higgsfield AI (kie.ai) image/video studio, embedded. */
+@Serializable
+data class StudioSettings(
+    val enabled: Boolean = false,
+    val imageModel: String = "nano-banana-2",
+    val videoModel: String = "kling/v2-1-pro",
+    /** Ask before each generation (they cost kie.ai credits). */
+    val confirm: Boolean = true,
+)
+
 /** A GGUF model file on the phone, run by the built-in llama.cpp engine. */
 @Serializable
 data class LocalModel(
@@ -279,6 +289,8 @@ data class AppSettings(
     val projects: List<Project> = emptyList(),
     val tasks: List<ScheduledTask> = emptyList(),
     val packages: List<ToolPackage> = emptyList(),
+    /** Embedded tools (built into the app); the API key is kept encrypted in the token store, not here. */
+    val studio: StudioSettings = StudioSettings(),
     /** Offer generate_image, create_document and text_to_speech to the model. */
     val fileTools: Boolean = true,
     /** Send messages that clearly ask for a picture straight to the image model (doesn't rely on the chat model using tools). */

@@ -324,6 +324,9 @@ private fun toolTitle(name: String) = when (name) {
     "run_agent" -> "Ask an agent"
     "use_skill" -> "Load a skill"
     "generate_image" -> "Generate image"
+    app.switchboard.studio.Studio.IMAGE_TOOL -> "Studio image"
+    app.switchboard.studio.Studio.VIDEO_TOOL -> "Studio video"
+    app.switchboard.studio.Studio.LIPSYNC_TOOL -> "Studio lip sync"
     "create_document" -> "Create file"
     "text_to_speech" -> "Create audio"
     else -> if (name.startsWith("mcp__") || name.startsWith("api__")) "Connector: " + name.substringAfter("__").replace("__", " › ") else name

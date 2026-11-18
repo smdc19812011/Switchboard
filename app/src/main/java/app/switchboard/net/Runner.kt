@@ -167,6 +167,7 @@ class Runner(private val baseUrl: String, private val token: String, private val
             return when (call.name) {
                 "run_command" -> a?.str("command") ?: call.arguments
                 "terminal_start" -> "Terminal: " + (a?.str("command")?.ifBlank { null } ?: "shell")
+                "studio_image", "studio_video", "studio_lip_sync" -> (a?.str("model") ?: "default model") + " · " + (a?.str("prompt") ?: a?.str("audio") ?: "").take(300)
                 "write_file", "read_file", INSTALL_APK, SEND_FILE -> a?.str("path") ?: call.arguments
                 else -> call.arguments
             }

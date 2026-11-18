@@ -126,6 +126,7 @@ fun DetailsPanel(vm: ChatViewModel, onClose: (() -> Unit)?, onOpenPage: (String)
         InfoRow(null, "Skills", "${s.skills.size}", onClick = { onOpenPage(Pages.SKILLS) })
         InfoRow(null, "Agents", "${s.agents.size}", onClick = { onOpenPage(Pages.AGENTS) })
         InfoRow(null, "Scheduled tasks", "${s.tasks.size}", onClick = { onOpenPage(Pages.TASKS) })
+        InfoRow(null, "Embedded tools", if (vm.studioReady) "studio on" else "off", onClick = { onOpenPage(Pages.EMBEDDED) })
     }
 }
 

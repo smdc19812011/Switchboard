@@ -85,6 +85,16 @@ Settings > Add provider > **Local model (GGUF on this phone)** runs a model on t
   A thin second bar shows how much of the model is in memory right now, read from `/proc`. That's the useful number for MoE and bigger-than-memory models, which read weights from storage as they go. "Load now to test" shows the same bar.
 - It needs a 64-bit ARM phone. Small models (1–4B parameters, Q4_K_M) are the practical size, and a model needs a bit more free memory than its file size. The engine is rebuilt with `tools/build-llama-server.sh`.
 
+## Embedded tools
+
+Settings > **Embedded tools** lists tools built into the app. The AI can use them in every chat (with tools on), whatever model you use, even a text-only one: the model writes the request, and the tool makes the result.
+
+- **Open Higgsfield AI** (based on [Open-Higgsfield-AI](https://github.com/smdc19812011/Open-Higgsfield-AI), MIT). Image, video and lip-sync generation through kie.ai, with 21 models. Add your kie.ai API key (stored encrypted, sent only to api.kie.ai) and tap **Test** to see your credits.
+  - `studio_image` makes images from text (Nano Banana 2/Pro, GPT Image 2, Grok Imagine). It also edits or combines up to 14 images from the chat (Nano Banana Edit, GPT Image 2 Edit, Qwen).
+  - `studio_video` makes videos from text, or animates a start image (Kling 2.1, Seedance 2, Wan 3, Sora 2, Veo 3).
+  - `studio_lip_sync` turns a portrait plus audio into a talking video (OmniHuman 1.5), or re-syncs a video to new audio.
+  - Switchboard uploads reference files, waits for the job and downloads the result into the chat. You choose default models, and **Ask before each generation** (on by default) confirms every paid job.
+
 ## Build Android apps on the phone (no Termux)
 In **This phone** mode the model has a `build_apk` tool. It writes the app as a web app (`index.html` plus CSS, JS and assets) in the workspace, and Switchboard packages it into a real, signed APK that's attached to the chat with an **Install** button.
 - Runtime: a 3 KB WebView activity (`tools/apk-template/`, rebuild with `build.sh`) shows `assets/www/index.html` full screen. JavaScript and localStorage are on, and links to websites open in the browser.

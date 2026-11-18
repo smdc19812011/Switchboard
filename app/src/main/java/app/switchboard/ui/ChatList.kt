@@ -95,7 +95,7 @@ fun ChatListPanel(
             item { NavRow(Icons.Default.Schedule, "Scheduled") { onOpenPage(Pages.TASKS) } }
             item { NavRow(Icons.Default.Tune, "Customize", trailing = if (customize) Icons.Default.ExpandLess else Icons.Default.ExpandMore) { customize = !customize } }
             if (customize) {
-                listOf(Pages.SKILLS to "Skills", Pages.AGENTS to "Agents", Pages.CONNECTORS to "Connectors", Pages.TOOLBOX to "Toolbox", Pages.PROJECTS to "Projects")
+                listOf(Pages.SKILLS to "Skills", Pages.AGENTS to "Agents", Pages.CONNECTORS to "Connectors", Pages.EMBEDDED to "Embedded tools", Pages.TOOLBOX to "Toolbox", Pages.PROJECTS to "Projects")
                     .forEach { (page, label) -> item(key = "cz-$page") { NavRow(null, label, indent = true) { onOpenPage(page) } } }
             }
             item { Spacer(Modifier.height(12.dp)) }

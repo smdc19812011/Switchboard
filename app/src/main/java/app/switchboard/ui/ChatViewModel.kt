@@ -27,6 +27,8 @@ import app.switchboard.net.RequestOptions
 import app.switchboard.net.Runner
 import app.switchboard.net.ApiException
 import app.switchboard.local.HfSearch
+import app.switchboard.studio.Studio
+import app.switchboard.studio.KieClient
 import app.switchboard.net.PhoneHost
 import app.switchboard.net.Termux
 import app.switchboard.net.ToolHost
@@ -673,6 +675,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun decide(a: Approval) { approvalDecision?.complete(a) }
 
+    /** Shows the Approve / Always / Deny card for [call] and waits for the answer. */
+    private suspend fun askApproval(call: ToolCall): Approval {
+        val d = CompletableDeferred<Approval>()
+        approvalDecision = d
+        pendingApproval = call
+        return try { d.await() } finally { pendingApproval = null; approvalDecision = null }
+    }
+
     private suspend fun runTool(call: ToolCall): ToolResult {
         if (call.name != "run_command") terms.appendLocal(TerminalHub.ACTIVITY,
             "\u001B[2m› ${call.name}: ${Runner.describe(call).take(160).replace("\n", " ")}\u001B[0m\r\n".toByteArray())
@@ -681,6 +691,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // Building only writes inside Switchboard's storage; installing still goes through Android's own prompt.
         if (call.name == BUILD_APK) return buildApk(call)
         if (call.name == Extras.USE_SKILL) return Extras.useSkill(argsOf(call), settings.skills)
+        if (call.name in Studio.toolNames) {
+            if (settings.studio.confirm && current.id !in alwaysAllowed) {
+                when (askApproval(call)) {
+                    Approval.DENY -> return ToolResult("The user declined this generation. Ask what to change.", isError = true)
+                    Approval.ALWAYS -> alwaysAllowed += current.id
+                    Approval.ONCE -> Unit
+                }
+            }
+            return studioTool(call)
+        }
         when (call.name) {
             FileTools.GENERATE_IMAGE -> return generateImage(argsOf(call))
             FileTools.CREATE_DOCUMENT -> return createDocument(argsOf(call))
@@ -881,6 +901,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 ". Files appear in the chat with Open/Save/Share buttons. Never say you can't make images or files: call these tools.")
         }
         if (allowAgents && toolsAllowed && settings.agents.isNotEmpty()) { tools += Extras.runAgent; sys += Extras.agentsNote(settings.agents) }
+        // Embedded Open Higgsfield studio: image, video and lip sync for any model, including text-only ones.
+        if (toolsAllowed && studioReady) {
+            tools += Studio.tools(settings.studio.imageModel, settings.studio.videoModel)
+            sys += "You can make images, videos and lip-sync videos yourself with studio_image, studio_video and studio_lip_sync (the Open Higgsfield studio). " +
+                "Use them whenever the user wants a picture, photo, illustration, video, animation or talking video, even though you only write text: " +
+                "write a detailed prompt and call the tool. Results appear in the chat. To animate or edit something you made, pass its file name."
+        }
         return base.copy(system = sys.filter { it.isNotBlank() }.joinToString("\n\n"), tools = tools)
     }
 
@@ -1496,6 +1523,90 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun fetchModels(p: Provider): Result<List<String>> = runCatching { client.listModels(p, settings.unrestricted) }
 
     /** Models the provider offers to this API key, with what each can produce. */
+    // --- embedded tools: Open Higgsfield studio (kie.ai) ---
+
+    private val STUDIO_KEY = "embedded:studio"
+    fun studioKey(): String = tokens.get(STUDIO_KEY)?.access.orEmpty()
+    fun setStudioKey(k: String) { if (k.isBlank()) tokens.remove(STUDIO_KEY) else tokens.put(STUDIO_KEY, app.switchboard.net.Tokens(k.trim())); studioKeyVersion++ }
+    /** Bumped when the key changes, so screens re-read whether it's set. */
+    var studioKeyVersion by mutableStateOf(0); private set
+    val studioReady: Boolean get() { studioKeyVersion; return settings.studio.enabled && studioKey().isNotBlank() }
+    fun updateStudio(f: (app.switchboard.data.StudioSettings) -> app.switchboard.data.StudioSettings) = updateSettings { it.copy(studio = f(it.studio)) }
+
+    /** Checks the key by reading the kie.ai credit balance. */
+    suspend fun testStudio(key: String = studioKey()): Result<String> = runCatching {
+        if (key.isBlank()) error("Enter your kie.ai API key first.")
+        "Key works · ${"%,.0f".format(KieClient(key).credits())} credits left"
+    }
+
+    /** A file the model named: one attached in this chat (by name), or a path on the tool machine (copied to the phone). */
+    private suspend fun studioFile(ref: String): File {
+        val name = ref.substringAfterLast('/')
+        val inChat = (current.messages.flatMap { it.attachments } + pendingAttachments).lastOrNull { it.name == ref || it.name == name || it.path == ref }
+            ?: (current.messages.flatMap { it.attachments } + pendingAttachments).lastOrNull { it.name.endsWith(name) || name.endsWith(it.name.substringAfter('-')) }
+        if (inChat != null && File(inChat.path).exists()) return File(inChat.path)
+        val dest = File(getApplication<Application>().cacheDir, "studio/${System.currentTimeMillis()}-$name")
+        runCatching { host().fetchFile(ref, dest) }.onFailure { throw ApiException("Couldn't find \"$ref\" in this chat or on the tool machine.") }
+        return dest
+    }
+
+    private suspend fun studioTool(call: ToolCall): ToolResult {
+        val a = argsOf(call)
+        val client = KieClient(studioKey().ifBlank { return ToolResult("The studio has no kie.ai API key yet (Settings > Embedded tools).", true) })
+        val prev = toolStatus
+        val key = "studio:${call.id}"
+        WorkService.hold(getApplication(), key, "Generating with the studio…")
+        fun status(what: String, secs: Int) { toolStatus = "Studio: $what · ${secs / 60}:${"%02d".format(secs % 60)}" }
+        return try {
+            val prompt = a.str("prompt").orEmpty()
+            val result: KieClient.Result = when (call.name) {
+                Studio.IMAGE_TOOL -> {
+                    if (prompt.isBlank()) return ToolResult("Missing 'prompt'.", true)
+                    val refs = (a["reference_files"] as? kotlinx.serialization.json.JsonArray)?.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }.orEmpty().take(14)
+                    var m = Studio.model(a.str("model")) ?: Studio.model(settings.studio.imageModel) ?: Studio.of(Studio.Kind.IMAGE).first()
+                    if (refs.isNotEmpty() && m.input.isEmpty()) m = Studio.model("nano-banana-edit")!! // that model can't take references
+                    if (m.kind !in setOf(Studio.Kind.IMAGE, Studio.Kind.EDIT)) return ToolResult("${m.id} isn't an image model.", true)
+                    toolStatus = "Studio: uploading ${refs.size} image${if (refs.size == 1) "" else "s"}…"
+                    val urls = refs.map { client.upload(studioFile(it)) }
+                    client.run(m.id, client.imageInput(m, prompt, a.str("aspect_ratio"), a.str("resolution"), urls), 10 * 60_000) { status("making an image with ${m.label}", it) }
+                }
+                Studio.VIDEO_TOOL -> {
+                    if (prompt.isBlank()) return ToolResult("Missing 'prompt'.", true)
+                    val m = Studio.model(a.str("model"))?.takeIf { it.kind == Studio.Kind.VIDEO } ?: Studio.model(settings.studio.videoModel) ?: Studio.of(Studio.Kind.VIDEO).first()
+                    val image = a.str("start_image")?.takeIf { it.isNotBlank() }?.let { toolStatus = "Studio: uploading the start image…"; client.upload(studioFile(it)) }
+                    val onWait: (Int) -> Unit = { status("making a video with ${m.label}", it) }
+                    if (m.input == "veo") client.runVeo(m.id, prompt, image, a.str("aspect_ratio"), a.str("resolution"), 30 * 60_000, onWait = onWait)
+                    else client.run(if (image != null) m.i2v ?: m.id else m.id, client.videoInput(m, prompt, image, a.str("aspect_ratio"), a.str("resolution"), a.str("duration")), 30 * 60_000, onWait = onWait)
+                }
+                else -> {
+                    val audio = a.str("audio")?.takeIf { it.isNotBlank() } ?: return ToolResult("Missing 'audio'.", true)
+                    val video = a.str("video")?.takeIf { it.isNotBlank() }; val image = a.str("image")?.takeIf { it.isNotBlank() }
+                    if (video == null && image == null) return ToolResult("Give an 'image' (portrait) or a 'video', plus 'audio'.", true)
+                    toolStatus = "Studio: uploading files…"
+                    val audioUrl = client.upload(studioFile(audio))
+                    val onWait: (Int) -> Unit = { status("lip syncing", it) }
+                    if (video != null) client.run("volcengine/video-to-video-lip-sync", kotlinx.serialization.json.buildJsonObject {
+                        put("mode", "basic"); put("video_url", client.upload(studioFile(video))); put("audio_url", audioUrl) }, 30 * 60_000, onWait = onWait)
+                    else client.run("omnihuman-1-5", kotlinx.serialization.json.buildJsonObject {
+                        put("image_url", client.upload(studioFile(image!!))); put("audio_url", audioUrl); put("output_resolution", "1080")
+                        if (prompt.isNotBlank()) put("prompt", prompt) }, 30 * 60_000, onWait = onWait)
+                }
+            }
+            toolStatus = "Studio: downloading…"
+            val label = Studio.model(result.model)?.label ?: result.model
+            val atts = result.urls.take(4).mapIndexed { i, url ->
+                val ext = url.substringBefore('?').substringAfterLast('.', "").lowercase().takeIf { it.length in 2..4 } ?: if (call.name == Studio.IMAGE_TOOL) "jpg" else "mp4"
+                val name = "studio-${result.model.substringAfterLast('/').take(24)}-${System.currentTimeMillis() % 100000}${if (i > 0) "-$i" else ""}.$ext"
+                val f = client.download(url, File(attachmentsDir(current.id), name))
+                Attachment(name, f.path, f.length(), MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: if (call.name == Studio.IMAGE_TOOL) "image/jpeg" else "video/mp4")
+            }
+            ToolResult("Made ${atts.joinToString { it.name }} with $label (Open Higgsfield studio via kie.ai); it's shown in the chat. " +
+                "To edit or animate it, pass the file name to studio_image (reference_files) or studio_video (start_image).", attachments = atts)
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e
+        } catch (e: Exception) { ToolResult(e.message ?: "Studio generation failed.", true)
+        } finally { toolStatus = prev; WorkService.release(getApplication(), key) }
+    }
+
     // --- local GGUF models (llama.cpp on the phone) ---
 
     /** The bundled engine is arm64 only. */

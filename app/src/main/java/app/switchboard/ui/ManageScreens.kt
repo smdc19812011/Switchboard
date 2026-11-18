@@ -79,13 +79,14 @@ object Pages {
     const val PROJECTS = "projects"
     const val TASKS = "tasks"
     const val TOOLBOX = "toolbox"
+    const val EMBEDDED = "embedded"
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ManagePage(vm: ChatViewModel, page: String, onBack: () -> Unit) {
     val title = mapOf(Pages.CONNECTORS to "Connectors", Pages.SKILLS to "Skills", Pages.AGENTS to "Agents",
-        Pages.PROJECTS to "Projects", Pages.TASKS to "Scheduled tasks", Pages.TOOLBOX to "Toolbox")[page] ?: page
+        Pages.PROJECTS to "Projects", Pages.TASKS to "Scheduled tasks", Pages.TOOLBOX to "Toolbox", Pages.EMBEDDED to "Embedded tools")[page] ?: page
     Scaffold(topBar = {
         TopAppBar(title = { Text(title) }, navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } })
     }) { pad ->
@@ -97,6 +98,7 @@ fun ManagePage(vm: ChatViewModel, page: String, onBack: () -> Unit) {
                 Pages.PROJECTS -> ProjectsPage(vm)
                 Pages.TASKS -> TasksPage(vm)
                 Pages.TOOLBOX -> ToolboxPage(vm)
+                Pages.EMBEDDED -> EmbeddedToolsPage(vm)
             }
         }
     }
