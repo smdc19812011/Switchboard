@@ -100,6 +100,7 @@ class ChatClient {
         // Servers send data or keep-alive pings while a model thinks; 2.5 min of total silence means the connection is dead.
         .readTimeout(150, TimeUnit.SECONDS)
         .build()
+    private val localHttp by lazy { http.newBuilder().readTimeout(10, TimeUnit.MINUTES).build() }
     private val json = Json { ignoreUnknownKeys = true }
     private val jsonType = "application/json".toMediaType()
 
@@ -112,7 +113,8 @@ class ChatClient {
             ApiKind.OPENAI_COMPATIBLE -> openAiRequest(p, msgs, opts)
         }
         checkTransport(request, opts.unrestricted)
-        val call = http.newCall(request)
+        // A local model reading weights from storage (first reply of a big/MoE model) can be quiet for minutes.
+        val call = (if (p.local != null) localHttp else http).newCall(request)
         if (p.local != null) app.switchboard.local.LocalEngine.requestStarted()
         // The blocking read runs in a child; awaitClose is registered right away, so Stop cancels the call immediately.
         launch(Dispatchers.IO) {

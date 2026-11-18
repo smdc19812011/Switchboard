@@ -71,20 +71,39 @@ object LocalEngine {
     fun requestStarted() { touch(); _progress.value = _progress.value?.copy(phase = Phase.READING, promptDone = 0, promptTotal = 0, tokens = 0, tokensPerSec = 0.0) }
 
     /** From the server's prompt_progress updates: [done] of [total] prompt tokens read (cached ones count as read). */
-    fun promptProgress(done: Int, total: Int) { touch(); _progress.value = _progress.value?.copy(phase = Phase.READING, promptDone = done, promptTotal = total) }
+    fun promptProgress(done: Int, total: Int) { touch(); if (_progress.value?.let { it.promptDone == done && it.promptTotal == total } == true) return; _progress.value = _progress.value?.copy(phase = Phase.READING, promptDone = done, promptTotal = total) }
 
     /** One more piece of the reply arrived (about one token). */
+    @Volatile private var tokenCount = 0
+    @Volatile private var lastPublish = 0L
+
     fun tokenArrived() {
         touch()
         val cur = _progress.value ?: return
         val now = System.currentTimeMillis()
-        if (cur.phase != Phase.WRITING) writeStart = now
-        val n = if (cur.phase != Phase.WRITING) 1 else cur.tokens + 1
+        if (cur.phase != Phase.WRITING) { writeStart = now; tokenCount = 0; lastPublish = 0 }
+        tokenCount++
+        // The status bar only needs a few updates a second, not one per token.
+        if (cur.phase == Phase.WRITING && now - lastPublish < 250) return
+        lastPublish = now
         val secs = (now - writeStart) / 1000.0
-        _progress.value = cur.copy(phase = Phase.WRITING, promptDone = cur.promptTotal, tokens = n, tokensPerSec = if (secs > 0.5) (n - 1) / secs else cur.tokensPerSec)
+        _progress.value = cur.copy(phase = Phase.WRITING, promptDone = cur.promptTotal, tokens = tokenCount,
+            tokensPerSec = if (secs > 0.5) (tokenCount - 1) / secs else cur.tokensPerSec)
     }
 
-    fun requestEnded() { _progress.value = _progress.value?.copy(phase = Phase.IDLE) }
+    fun requestEnded() { _progress.value = _progress.value?.copy(phase = Phase.IDLE, tokens = tokenCount) }
+
+    /**
+     * If memory runs out, Android should stop the engine (Switchboard then explains what happened) rather than
+     * Switchboard itself: make the engine slightly more expendable than the app. Raising it needs no permission;
+     * best effort if the system doesn't allow it.
+     */
+    private fun preferKillingEngine(pid: Long) {
+        runCatching {
+            val own = File("/proc/self/oom_score_adj").readText().trim().toInt()
+            File("/proc/$pid/oom_score_adj").writeText("${(own + 100).coerceIn(0, 1000)}")
+        }
+    }
 
     /** Bytes of the model file mapped into the engine's memory (RssFile in /proc), or -1 if unknown. */
     private fun residentOf(pid: Long): Long = runCatching {
@@ -124,15 +143,16 @@ object LocalEngine {
         val key = Key(file.path, lm.contextSize.coerceIn(512, 262_144), lm.threads, p.apiKey, lm.largeMode)
         keepMs = lm.keepMinutes.coerceAtLeast(1) * 60_000L
         touch()
-        mutex.withLock {
-            if (running == key && proc?.isAlive == true && healthy(key.apiKey)) return
+        // All engine work (health checks, waiting for an old engine to exit, starting) stays off the main thread.
+        withContext(Dispatchers.IO) { mutex.withLock {
+            if (running == key && proc?.isAlive == true && healthy(key.apiKey)) return@withLock
             stopLocked()
             try { start(bin, key, p.model.ifBlank { file.name }, quantCache = key.large) }
             catch (e: ApiException) {
                 // Some models can't use the 8-bit conversation cache (head size not a multiple of 32): use the normal one.
                 if (key.large && "cache type" in recentLog(40)) start(bin, key, p.model.ifBlank { file.name }, quantCache = false) else throw e
             }
-        }
+        } }
         touch()
     }
 
@@ -151,7 +171,7 @@ object LocalEngine {
         proc = p; running = key
         val pid = pidOf(p)
         runCatching { stateDir?.let { File(it, "llama-server.pid").writeText(pid.toString()) } }
-        if (pid > 0) startMonitor(p, pid)
+        if (pid > 0) { startMonitor(p, pid); preferKillingEngine(pid) }
         Thread {
             p.inputStream.bufferedReader().forEachLine { line -> synchronized(log) { log.addLast(line); while (log.size > 200) log.removeFirst() } }
         }.apply { isDaemon = true }.start()
@@ -205,7 +225,7 @@ object LocalEngine {
     }
 
     /** Unloads the model and frees its memory. */
-    suspend fun stop() = mutex.withLock { stopLocked() }
+    suspend fun stop() = withContext(Dispatchers.IO) { mutex.withLock { stopLocked() } }
 
     private fun stopLocked() {
         idleJob?.cancel(); idleJob = null

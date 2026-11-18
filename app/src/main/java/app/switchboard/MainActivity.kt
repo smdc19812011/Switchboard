@@ -17,6 +17,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.gestures.draggable
@@ -90,6 +92,8 @@ class MainActivity : ComponentActivity() {
                 var page by rememberSaveable { mutableStateOf<String?>(null) }
                 var showModels by rememberSaveable { mutableStateOf(false) }
                 var renaming by remember { mutableStateOf<Conversation?>(null) }
+                // Why the app closed last time (crash, out of memory, not responding), shown once.
+                var exitReport by remember { mutableStateOf(CrashReport.takeLast(this@MainActivity)) }
                 val drawer = rememberDrawerState(DrawerValue.Closed)
                 val scope = rememberCoroutineScope()
                 val ctx = LocalContext.current
@@ -150,6 +154,22 @@ class MainActivity : ComponentActivity() {
                 }
                 if (showModels) ModelSheet(vm, onDismiss = { showModels = false }, onEditProviders = { showSettings = true })
                 renaming?.let { c -> RenameDialog(vm, c) { renaming = null } }
+                exitReport?.let { r ->
+                    AlertDialog(onDismissRequest = { exitReport = null }, title = { Text(r.title) },
+                        text = {
+                            Column(Modifier.androidxVerticalScroll(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text(r.explanation)
+                                Text(r.details.take(1500), style = MaterialTheme.typography.bodySmall, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        },
+                        confirmButton = { TextButton(onClick = { exitReport = null }) { Text("OK") } },
+                        dismissButton = { TextButton(onClick = {
+                            val cm = getSystemService(android.content.ClipboardManager::class.java)
+                            cm.setPrimaryClip(android.content.ClipData.newPlainText("Switchboard report", r.title + "\n" + r.explanation + "\n\n" + r.details))
+                            Toast.makeText(this@MainActivity, "Details copied", Toast.LENGTH_SHORT).show()
+                        }) { Text("Copy details") } })
+                }
             }
         }
     }
@@ -198,6 +218,9 @@ private fun PaneDivider(onDrag: (Float) -> Unit, onDragEnd: () -> Unit) {
             .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.6f)))
     }
 }
+
+@Composable
+private fun Modifier.androidxVerticalScroll() = this.heightIn(max = 420.dp).verticalScroll(androidx.compose.foundation.rememberScrollState())
 
 @Composable
 private fun RenameDialog(vm: ChatViewModel, c: Conversation, onDismiss: () -> Unit) {
