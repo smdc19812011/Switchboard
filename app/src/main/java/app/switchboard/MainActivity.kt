@@ -73,6 +73,8 @@ import androidx.compose.ui.unit.dp
 import app.switchboard.data.Conversation
 import app.switchboard.ui.ChatScreen
 import app.switchboard.ui.DetailsPanel
+import app.switchboard.ui.AppPanes
+import app.switchboard.ui.PaneStore
 import app.switchboard.ui.ChatViewModel
 import app.switchboard.ui.ManagePage
 import app.switchboard.ui.ModelSheet
@@ -114,71 +116,11 @@ class MainActivity : ComponentActivity() {
                 if (page != null) { ManagePage(vm, page!!, onBack = { page = null }); return@SwitchboardTheme }
                 if (showSettings) { SettingsScreen(vm, onBack = { showSettings = false }, onOpen = { page = it }); return@SwitchboardTheme }
 
-                // Wide screens (unfolded Fold, tablets, landscape): chat list stays open beside the chat; ☰ hides/shows it.
-                val wide = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp >= 700
-                var paneOpen by rememberSaveable { mutableStateOf(true) }
-                val openProjects = { showSettings = true; page = Pages.PROJECTS }
-                // Details panel (context, connectors, engine): on the right on wide screens, a sheet on phones.
-                val veryWide = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp >= 1000
-                var detailsOpen by rememberSaveable { mutableStateOf(veryWide) }
-                val openPage: (String) -> Unit = { page = it }
-                if (wide) {
-                    // Pane widths are dragged with the dividers and remembered between launches.
-                    val prefs = remember { ctx.getSharedPreferences("ui", android.content.Context.MODE_PRIVATE) }
-                    val screenDp = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp
-                    val minPane = 240f; val maxPane = (screenDp * 0.6f).coerceAtLeast(minPane + 40)
-                    var paneWidth by remember { mutableStateOf(prefs.getFloat("paneWidth", 300f).coerceIn(minPane, maxPane)) }
-                    val maxRight = (screenDp * 0.45f).coerceAtLeast(260f)
-                    var rightWidth by remember { mutableStateOf(prefs.getFloat("rightWidth", 320f).coerceIn(240f, maxRight)) }
-                    val density = androidx.compose.ui.platform.LocalDensity.current
-                    Row(Modifier.fillMaxSize()) {
-                        androidx.compose.animation.AnimatedVisibility(paneOpen) {
-                            Row {
-                                androidx.compose.material3.Surface(color = MaterialTheme.colorScheme.surfaceContainer,
-                                    modifier = Modifier.width(paneWidth.dp).fillMaxHeight()) {
-                                    ChatListPanel(vm, onPick = { vm.open(it) }, onNew = { vm.newChat(it) }, onRename = { renaming = it },
-                                        onManageProjects = openProjects, onSettings = { showSettings = true }, onOpenPage = openPage,
-                                        modifier = Modifier.statusBarsPadding().navigationBarsPadding())
-                                }
-                                PaneDivider(onDrag = { px -> paneWidth = (paneWidth + with(density) { px.toDp().value }).coerceIn(minPane, maxPane) },
-                                    onDragEnd = { prefs.edit().putFloat("paneWidth", paneWidth).apply() })
-                            }
-                        }
-                        Box(Modifier.weight(1f)) {
-                            ChatScreen(vm, onMenu = { paneOpen = !paneOpen }, onSettings = { showSettings = true }, onPickModel = { showModels = true },
-                                showSettings = !paneOpen, onDetails = { detailsOpen = !detailsOpen }, detailsOpen = detailsOpen, onRename = { renaming = it })
-                        }
-                        androidx.compose.animation.AnimatedVisibility(detailsOpen) {
-                            Row {
-                                PaneDivider(onDrag = { px -> rightWidth = (rightWidth - with(density) { px.toDp().value }).coerceIn(240f, maxRight) },
-                                    onDragEnd = { prefs.edit().putFloat("rightWidth", rightWidth).apply() })
-                                androidx.compose.material3.Surface(color = MaterialTheme.colorScheme.surfaceContainer, modifier = Modifier.width(rightWidth.dp).fillMaxHeight()) {
-                                    DetailsPanel(vm, onClose = null, onOpenPage = openPage, onPickModel = { showModels = true },
-                                        modifier = Modifier.statusBarsPadding().navigationBarsPadding())
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    ModalNavigationDrawer(drawerState = drawer, drawerContent = {
-                        ModalDrawerSheet {
-                            ChatListPanel(vm,
-                                onPick = { vm.open(it); scope.launch { drawer.close() } },
-                                onNew = { projectId -> vm.newChat(projectId); scope.launch { drawer.close() } },
-                                onRename = { renaming = it },
-                                onManageProjects = { openProjects(); scope.launch { drawer.close() } },
-                                onSettings = { showSettings = true; scope.launch { drawer.close() } },
-                                onOpenPage = { p -> openPage(p); scope.launch { drawer.close() } })
-                        }
-                    }) {
-                        ChatScreen(vm, onMenu = { scope.launch { drawer.open() } }, onSettings = { showSettings = true }, onPickModel = { showModels = true },
-                            onDetails = { detailsOpen = !detailsOpen }, detailsOpen = detailsOpen, onRename = { renaming = it })
-                    }
-                    if (detailsOpen) androidx.compose.material3.ModalBottomSheet(onDismissRequest = { detailsOpen = false }) {
-                        DetailsPanel(vm, onClose = { detailsOpen = false }, onOpenPage = { p -> detailsOpen = false; openPage(p) },
-                            onPickModel = { detailsOpen = false; showModels = true }, modifier = Modifier.navigationBarsPadding())
-                    }
-                }
+                // Sidebar, chat and details panel, sized for the screen (phones, every Fold's cover and inner screen, tablets).
+                val prefs = remember { ctx.getSharedPreferences("ui", android.content.Context.MODE_PRIVATE) }
+                AppPanes(vm, store = PaneStore(get = { k, d -> prefs.getFloat(k, d) }, set = { k, v -> prefs.edit().putFloat(k, v).apply() }),
+                    drawer = drawer, onRename = { renaming = it }, onSettings = { showSettings = true }, onPickModel = { showModels = true },
+                    onOpenPage = { page = it })
                 if (showModels) ModelSheet(vm, onDismiss = { showModels = false }, onEditProviders = { showSettings = true })
                 renaming?.let { c -> RenameDialog(vm, c) { renaming = null } }
                 exitReport?.let { r ->
@@ -230,19 +172,6 @@ class MainActivity : ComponentActivity() {
                 intent.action = null
             }
         }
-    }
-}
-
-/** The draggable line between the chat list and the chat: a wide invisible touch area with a small visible grip. */
-@Composable
-private fun PaneDivider(onDrag: (Float) -> Unit, onDragEnd: () -> Unit) {
-    Box(Modifier.width(16.dp).fillMaxHeight()
-        .draggable(rememberDraggableState(onDrag), androidx.compose.foundation.gestures.Orientation.Horizontal, onDragStopped = { onDragEnd() })
-        .semantics { contentDescription = "Resize chat list" },
-        contentAlignment = Alignment.Center) {
-        Box(Modifier.fillMaxHeight().width(1.dp).background(MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)))
-        Box(Modifier.width(6.dp).height(48.dp).clip(androidx.compose.foundation.shape.RoundedCornerShape(3.dp))
-            .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.6f)))
     }
 }
 
