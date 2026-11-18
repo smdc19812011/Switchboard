@@ -94,6 +94,7 @@ class LocalModelTest {
             assertTrue(seen.toString(), seen.any { it.phase == LocalEngine.Phase.WRITING && it.tokens > 0 })
             assertEquals(LocalEngine.Phase.IDLE, LocalEngine.progress.value!!.phase)
             assertTrue("resident ${LocalEngine.progress.value}", LocalEngine.progress.value!!.residentBytes > 0)
+            assertTrue("threads ${LocalEngine.progress.value}", LocalEngine.progress.value!!.threads > 0)
             // Bigger-than-memory mode restarts the engine with its options and still answers. This tiny model's head size (16)
             // can't use the 8-bit cache, so this also covers the automatic retry with the normal cache.
             val large = p.copy(local = p.local!!.copy(largeMode = true))

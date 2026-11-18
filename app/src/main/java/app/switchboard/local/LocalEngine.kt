@@ -58,6 +58,8 @@ object LocalEngine {
     data class Progress(
         val phase: Phase, val name: String, val modelBytes: Long, val residentBytes: Long = 0, val large: Boolean = false,
         val promptDone: Int = 0, val promptTotal: Int = 0, val tokens: Int = 0, val tokensPerSec: Double = 0.0,
+        /** Compute threads the engine uses, how many are running right now, and the phone's CPU cores. */
+        val threads: Int = 0, val busyThreads: Int = 0, val cores: Int = Runtime.getRuntime().availableProcessors(),
     ) {
         val memoryFraction get() = if (modelBytes > 0) (residentBytes.toDouble() / modelBytes).coerceIn(0.0, 1.0) else 0.0
         val promptFraction get() = if (promptTotal > 0) (promptDone.toDouble() / promptTotal).coerceIn(0.0, 1.0) else 0.0
@@ -94,6 +96,16 @@ object LocalEngine {
 
     fun requestEnded() { _progress.value = _progress.value?.copy(phase = Phase.IDLE, tokens = tokenCount) }
 
+    /** Compute threads from the engine's log, or 0 if it hasn't said yet. */
+    fun threadsFromLog(log: String): Int = Regex("n_threads = (\\d+)").findAll(log).lastOrNull()?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
+    /** Threads of the engine that are running on a CPU right now (state R in /proc/<pid>/task/<tid>/stat). */
+    private fun runningThreads(pid: Long): Int = runCatching {
+        File("/proc/$pid/task").listFiles()?.count { t ->
+            runCatching { File(t, "stat").readText().substringAfterLast(") ").firstOrNull() == 'R' }.getOrDefault(false)
+        } ?: 0
+    }.getOrDefault(0)
+
     /** Bytes of the model file mapped into the engine's memory (RssFile in /proc), or -1 if unknown. */
     private fun residentOf(pid: Long): Long = runCatching {
         File("/proc/$pid/status").readLines().firstOrNull { it.startsWith("RssFile:") }
@@ -104,9 +116,16 @@ object LocalEngine {
     private fun startMonitor(p: EngineHandle, pid: Long) {
         monitorJob?.cancel()
         monitorJob = scope.launch {
+            var threads = 0
             while (isActive && p.isAlive) {
                 val r = residentOf(pid)
-                if (r >= 0) _progress.value = _progress.value?.let { it.copy(residentBytes = minOf(r, it.modelBytes)) }
+                // The engine logs its thread count once ("llama threadpool init, n_threads = 8").
+                if (threads == 0) threads = threadsFromLog(p.log(80))
+                val busy = runningThreads(pid)
+                _progress.value = _progress.value?.let { pr ->
+                    pr.copy(residentBytes = if (r >= 0) minOf(r, pr.modelBytes) else pr.residentBytes, threads = threads,
+                        busyThreads = if (threads > 0) busy.coerceAtMost(threads) else busy)
+                }
                 delay(if (_progress.value?.phase == Phase.IDLE) 3000 else 500)
             }
         }

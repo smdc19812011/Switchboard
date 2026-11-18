@@ -27,11 +27,15 @@ fun localStatusLines(pr: LocalEngine.Progress): Pair<String, String?> {
         LocalEngine.Phase.IDLE -> "${pr.name} is loaded"
     }
     val pct = (pr.memoryFraction * 100).toInt()
-    val detail = when {
+    val memory = when {
         pr.phase == LocalEngine.Phase.LOADING -> "$mem in memory ($pct%)" + if (pr.large) " · bigger-than-memory mode reads the rest from storage as it's needed" else ""
         pr.large || pr.memoryFraction < 0.95 -> "Model in memory: $pct% ($mem)" + if (pct < 95) " · reading weights from storage as needed (slower)" else ""
         else -> null
     }
+    // While it reads or writes, how many of its threads are actually running (fewer than set = waiting on storage or memory).
+    val threads = if (pr.threads > 0) "Threads: ${pr.threads} of ${pr.cores} cores" +
+        (if (pr.phase == LocalEngine.Phase.READING || pr.phase == LocalEngine.Phase.WRITING) " · ${pr.busyThreads} busy now" else "") else null
+    val detail = listOfNotNull(memory, threads).joinToString("\n").ifEmpty { null }
     return title to detail
 }
 
