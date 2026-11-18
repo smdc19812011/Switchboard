@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -23,6 +24,9 @@ import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -64,90 +68,127 @@ fun ago(ms: Long, now: Long = System.currentTimeMillis(), zone: ZoneId = ZoneId.
 }
 
 /**
- * The chat list: search, projects (expandable, with "new chat here"), chats with when they were last active and what
- * answered, and a New chat button. Used as the side pane on wide screens and inside the drawer on phones.
+ * The sidebar: New chat, Search, Scheduled and Customize at the top; then chats grouped under their projects
+ * (collapsible) and "No folder"; settings at the bottom. Used as the side pane on wide screens and in the drawer on phones.
  */
 @Composable
 fun ChatListPanel(
     vm: ChatViewModel, onPick: (String) -> Unit, onNew: (String?) -> Unit, onRename: (Conversation) -> Unit,
-    onManageProjects: () -> Unit, onSettings: () -> Unit, modifier: Modifier = Modifier,
+    onManageProjects: () -> Unit, onSettings: () -> Unit, modifier: Modifier = Modifier, onOpenPage: (String) -> Unit = { onManageProjects() },
 ) {
     val projects = vm.settings.projects
-    var expanded by rememberSaveable { mutableStateOf(setOf<String>()) }
+    var collapsed by rememberSaveable { mutableStateOf(setOf<String>()) }
     var searching by rememberSaveable { mutableStateOf(false) }
+    var customize by rememberSaveable { mutableStateOf(false) }
     var query by rememberSaveable { mutableStateOf("") }
     val q = query.trim()
     fun matches(c: Conversation) = q.isEmpty() || c.title.contains(q, true) || c.messages.any { it.text.contains(q, true) }
 
-    Box(modifier.fillMaxSize()) {
-    Column(Modifier.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 12.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("Chats", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-            IconButton(onClick = { searching = !searching; if (!searching) query = "" }) { Icon(if (searching) Icons.Default.Close else Icons.Default.Search, if (searching) "Close search" else "Search chats") }
+    Column(modifier.fillMaxSize()) {
+        LazyColumn(Modifier.weight(1f).padding(top = 8.dp)) {
+            item { NavRow(Icons.Default.Add, "New chat") { onNew(null) } }
+            item { NavRow(if (searching) Icons.Default.Close else Icons.Default.Search, if (searching) "Close search" else "Search") { searching = !searching; if (!searching) query = "" } }
+            if (searching) item {
+                OutlinedTextField(query, { query = it }, placeholder = { Text("Chats and messages") }, singleLine = true,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp))
+            }
+            item { NavRow(Icons.Default.Schedule, "Scheduled") { onOpenPage(Pages.TASKS) } }
+            item { NavRow(Icons.Default.Tune, "Customize", trailing = if (customize) Icons.Default.ExpandLess else Icons.Default.ExpandMore) { customize = !customize } }
+            if (customize) {
+                listOf(Pages.SKILLS to "Skills", Pages.AGENTS to "Agents", Pages.CONNECTORS to "Connectors", Pages.TOOLBOX to "Toolbox", Pages.PROJECTS to "Projects")
+                    .forEach { (page, label) -> item(key = "cz-$page") { NavRow(null, label, indent = true) { onOpenPage(page) } } }
+            }
+            item { Spacer(Modifier.height(12.dp)) }
+
+            if (q.isNotEmpty()) {
+                val found = vm.conversations.filter(::matches)
+                item { GroupHeader("Results", null, null) }
+                if (found.isEmpty()) item { Text("Nothing found", Modifier.padding(horizontal = 20.dp, vertical = 6.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                items(found, key = { "r-" + it.id }) { c -> ChatRow(vm, c, indent = false, onPick, onRename) }
+            } else {
+                projects.forEach { p ->
+                    val open = p.id !in collapsed
+                    item(key = "p-" + p.id) {
+                        GroupHeader(p.name, open, onNewHere = { onNew(p.id) }) { collapsed = if (open) collapsed + p.id else collapsed - p.id }
+                    }
+                    if (open) {
+                        val chats = vm.conversations.filter { it.projectId == p.id }
+                        if (chats.isEmpty()) item(key = "pe-" + p.id) { Text("No chats yet", Modifier.padding(start = 28.dp, bottom = 6.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                        items(chats, key = { it.id }) { c -> ChatRow(vm, c, indent = false, onPick, onRename) }
+                    }
+                }
+                val loose = vm.conversations.filter { c -> c.projectId == null || projects.none { it.id == c.projectId } }
+                val open = "none" !in collapsed
+                item(key = "p-none") { GroupHeader(if (projects.isEmpty()) "Chats" else "No folder", open, null) { collapsed = if (open) collapsed + "none" else collapsed - "none" } }
+                if (open) {
+                    if (loose.isEmpty()) item { Text("No chats yet", Modifier.padding(start = 28.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    items(loose, key = { "c-" + it.id }) { c -> ChatRow(vm, c, indent = false, onPick, onRename) }
+                }
+            }
+            item { Spacer(Modifier.height(16.dp)) }
+        }
+        // Footer: the app and its settings.
+        androidx.compose.material3.HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
+        Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(28.dp).clip(androidx.compose.foundation.shape.CircleShape).background(MaterialTheme.colorScheme.secondary), contentAlignment = Alignment.Center) {
+                Text("S", color = MaterialTheme.colorScheme.onSecondary, style = MaterialTheme.typography.labelLarge)
+            }
+            Spacer(Modifier.size(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Switchboard", style = MaterialTheme.typography.bodyMedium)
+                Text("${vm.rotation.size} provider${if (vm.rotation.size == 1) "" else "s"} on · ${vm.settings.runnerMode.label()}",
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
             IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Settings") }
         }
-        if (searching) OutlinedTextField(query, { query = it }, placeholder = { Text("Search chats and messages") }, singleLine = true,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp))
-
-        LazyColumn(Modifier.weight(1f)) {
-            if (q.isEmpty()) {
-                item {
-                    Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Projects", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
-                        TextButton(onClick = onManageProjects) { Text(if (projects.isEmpty()) "New" else "Manage") }
-                    }
-                }
-                projects.forEach { p ->
-                    val open = p.id in expanded
-                    item(key = "p-" + p.id) {
-                        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp).clip(RoundedCornerShape(12.dp))
-                            .combinedClickableCompat(onClick = { expanded = if (open) expanded - p.id else expanded + p.id })
-                            .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Folder, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary)
-                            Spacer(Modifier.size(12.dp))
-                            Text(p.name, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                            IconButton(onClick = { onNew(p.id) }) { Icon(Icons.Default.Add, "New chat in ${p.name}") }
-                            Icon(if (open) Icons.Default.ExpandLess else Icons.Default.ExpandMore, null)
-                        }
-                    }
-                    if (open) items(vm.conversations.filter { it.projectId == p.id }, key = { it.id }) { c -> ChatRow(vm, c, indent = true, onPick, onRename) }
-                }
-            }
-            item {
-                Text(if (q.isEmpty()) "Recent" else "Results", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(start = 20.dp, top = 12.dp, bottom = 4.dp))
-            }
-            val list = if (q.isEmpty()) vm.conversations.filter { c -> c.projectId == null || projects.none { it.id == c.projectId } } else vm.conversations.filter(::matches)
-            if (list.isEmpty()) item { Text(if (q.isEmpty()) "No chats yet" else "Nothing found", Modifier.padding(horizontal = 20.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
-            items(list, key = { "c-" + it.id }) { c -> ChatRow(vm, c, indent = false, onPick, onRename) }
-            item { Spacer(Modifier.size(88.dp)) } // room above the New chat button
-        }
-    }
-    ExtendedFloatingActionButton(onClick = { onNew(null) }, icon = { Icon(Icons.Default.Add, null) }, text = { Text("New chat") },
-        modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp))
     }
 }
 
-/** One chat: title and "when", then what it belongs to or what answered last. Long-press for Rename / Delete. */
+private fun app.switchboard.data.RunnerMode.label() = when (this) {
+    app.switchboard.data.RunnerMode.PHONE -> "tools on this phone"
+    app.switchboard.data.RunnerMode.TERMUX -> "tools in Termux"
+    app.switchboard.data.RunnerMode.REMOTE -> "tools on computer"
+}
+
+@Composable
+private fun NavRow(icon: androidx.compose.ui.graphics.vector.ImageVector?, label: String, indent: Boolean = false,
+                   trailing: androidx.compose.ui.graphics.vector.ImageVector? = null, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp).clip(RoundedCornerShape(10.dp)).combinedClickableCompat(onClick = onClick)
+        .padding(start = if (indent) 44.dp else 12.dp, end = 12.dp, top = 9.dp, bottom = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (icon != null) { Icon(icon, null, Modifier.size(20.dp)); Spacer(Modifier.size(14.dp)) }
+        Text(label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+        trailing?.let { Icon(it, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant) }
+    }
+}
+
+/** A project (or "No folder") heading: tap to fold; + starts a chat in it. */
+@Composable
+private fun GroupHeader(title: String, open: Boolean?, onNewHere: (() -> Unit)?, onToggle: () -> Unit = {}) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp).clip(RoundedCornerShape(10.dp)).combinedClickableCompat(onClick = onToggle)
+        .padding(start = 12.dp, end = 4.dp, top = 2.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(title, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        if (open != null) Icon(if (open) Icons.Default.ExpandMore else Icons.Default.ChevronRight, if (open) "Fold $title" else "Unfold $title",
+            Modifier.padding(start = 4.dp).size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.weight(1f))
+        if (onNewHere != null) IconButton(onClick = onNewHere, modifier = Modifier.size(36.dp)) { Icon(Icons.Default.Add, "New chat in $title", Modifier.size(18.dp)) }
+        else Spacer(Modifier.height(36.dp))
+    }
+}
+
+/** One chat: its title and when it was last active. Long-press for Rename / Delete. */
 @Composable
 private fun ChatRow(vm: ChatViewModel, c: Conversation, indent: Boolean, onPick: (String) -> Unit, onRename: (Conversation) -> Unit) {
     var menu by remember { mutableStateOf(false) }
     val selected = c.id == vm.current.id
-    val subtitle = vm.settings.projects.firstOrNull { it.id == c.projectId }?.name
-        ?: c.messages.lastOrNull { it.role == MsgRole.ASSISTANT && it.source != null }?.source
-        ?: "No replies yet"
     Box {
-        Column(Modifier.fillMaxWidth().padding(start = if (indent) 24.dp else 8.dp, end = 8.dp, top = 2.dp, bottom = 2.dp).clip(RoundedCornerShape(12.dp))
+        Row(Modifier.fillMaxWidth().padding(start = if (indent) 24.dp else 8.dp, end = 8.dp, top = 1.dp, bottom = 1.dp).clip(RoundedCornerShape(10.dp))
             .background(if (selected) MaterialTheme.colorScheme.surfaceContainerHigh else androidx.compose.ui.graphics.Color.Transparent)
             .combinedClickableCompat(onClick = { onPick(c.id) }, onLongClick = { menu = true })
-            .padding(horizontal = 14.dp, vertical = 10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(c.title, style = MaterialTheme.typography.bodyLarge, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                Spacer(Modifier.size(8.dp))
-                Text(ago(c.updatedAt), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            .padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(c.title, style = MaterialTheme.typography.bodyLarge, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            Spacer(Modifier.size(8.dp))
+            Text(ago(c.updatedAt), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
             DropdownMenuItem(text = { Text("Rename or move") }, onClick = { menu = false; onRename(c) })

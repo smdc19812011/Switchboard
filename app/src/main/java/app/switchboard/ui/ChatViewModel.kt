@@ -273,6 +273,46 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** The provider that answers next (shown in the title and the request counter). */
+    // --- context usage (the details panel) ---
+
+    /** Size of the instructions and tool descriptions sent with the last request (updated on each reply). */
+    var lastSystemChars by mutableStateOf(0); private set
+    var lastToolChars by mutableStateOf(0); private set
+    var lastToolCount by mutableStateOf(0); private set
+
+    /** Context window per "providerId/model", from the provider's model list (looked up once when the panel needs it). */
+    var contextWindows by mutableStateOf(mapOf<String, Int>()); private set
+    private val contextLookups = mutableSetOf<String>()
+
+    fun lookupContextWindow(p: Provider) {
+        val key = "${p.id}/${p.model}"
+        p.local?.let { contextWindows = contextWindows + (key to it.contextSize); return }
+        if (key in contextWindows || !contextLookups.add(key)) return
+        viewModelScope.launch {
+            runCatching { client.listModelsDetailed(p, settings.unrestricted) }.getOrNull()
+                ?.firstOrNull { it.id == p.model }?.contextLength?.let { contextWindows = contextWindows + (key to it) }
+        }
+    }
+
+    /** Estimated tokens in the open chat by kind (about 4 characters per token), for the context meter. */
+    data class ContextUsage(val parts: List<Pair<String, Int>>, val window: Int?) {
+        val used get() = parts.sumOf { it.second }
+    }
+
+    fun contextUsage(p: Provider?): ContextUsage {
+        val msgs = current.messages
+        val messageChars = msgs.sumOf { it.text.length + it.thinking.length + it.toolCalls.sumOf { c -> c.arguments.length + c.name.length } }
+        val fileChars = msgs.sumOf { m -> m.attachments.sumOf { (it.text?.length ?: 0) + it.name.length + 40 } }
+        fun t(chars: Int) = (chars + 3) / 4
+        val parts = listOf(
+            "Messages" to t(messageChars),
+            "Files in chat" to t(fileChars),
+            "Instructions" to t(lastSystemChars.takeIf { it > 0 } ?: (settings.systemPrompt.length + 400)),
+            "Tool descriptions" to t(lastToolChars),
+        )
+        return ContextUsage(parts, p?.let { contextWindows["${it.id}/${it.model}"] })
+    }
+
     fun providerFor(agent: Agent?): Provider? = nextProviders(agent).firstOrNull()
 
     init {
@@ -420,6 +460,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         job = viewModelScope.launch {
             try {
                 val opts = buildOptions()
+                lastSystemChars = opts.system.length
+                lastToolChars = opts.tools.sumOf { it.name.length + it.description.length + it.schema.toString().length }
+                lastToolCount = opts.tools.size
                 var steps = 0
                 var order = providers
                 while (true) {

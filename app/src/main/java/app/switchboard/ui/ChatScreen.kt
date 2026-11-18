@@ -33,6 +33,10 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material.icons.filled.ViewSidebar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
@@ -84,7 +88,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 /** [showSettings] is off while the side chat list (which has its own ⚙) is open, so there is only one settings button. */
-fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, onPickModel: () -> Unit, showSettings: Boolean = true) {
+fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, onPickModel: () -> Unit, showSettings: Boolean = true,
+               onDetails: () -> Unit = {}, detailsOpen: Boolean = false, onRename: (app.switchboard.data.Conversation) -> Unit = {}) {
     val provider = vm.activeProvider
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val notifPermission = androidx.activity.compose.rememberLauncherForActivityResult(
@@ -99,33 +104,39 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
     }
     Scaffold(
         topBar = {
-            CenterAlignedTopAppBar(
+            TopAppBar(
                 navigationIcon = { IconButton(onClick = onMenu) { Icon(Icons.Default.Menu, "Chats") } },
                 title = {
-                    Row(
-                        Modifier.clip(RoundedCornerShape(50)).clickable(enabled = provider != null, onClick = onPickModel)
-                            .padding(horizontal = 12.dp, vertical = 6.dp)
-                            .semantics { contentDescription = "Switch provider or model" },
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.widthIn(max = 220.dp)) {
-                            Text(provider?.model?.ifBlank { "No model set" } ?: "Switchboard",
-                                style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            if (provider != null) Text((vm.currentAgent?.let { "${it.name} · " } ?: "") + provider.name + if (vm.settings.unrestricted) " · Unrestricted" else "",
-                                style = MaterialTheme.typography.labelSmall, maxLines = 1,
-                                color = if (vm.settings.unrestricted) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant)
+                    // The chat's title; tap for Rename / New chat / Delete.
+                    var chatMenu by remember { mutableStateOf(false) }
+                    Box {
+                        Row(Modifier.clip(RoundedCornerShape(10.dp)).clickable { chatMenu = true }.padding(horizontal = 8.dp, vertical = 4.dp)
+                            .semantics { contentDescription = "Chat options" }, verticalAlignment = Alignment.CenterVertically) {
+                            Text(vm.current.title.ifBlank { "New chat" }.takeIf { vm.current.messages.isNotEmpty() } ?: "New chat",
+                                style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 420.dp))
+                            Icon(Icons.Default.ExpandMore, null, Modifier.size(18.dp))
                         }
-                        if (provider != null) Icon(Icons.Default.ExpandMore, null, Modifier.size(18.dp))
+                        DropdownMenu(expanded = chatMenu, onDismissRequest = { chatMenu = false }) {
+                            DropdownMenuItem(text = { Text("Rename or move to project") }, enabled = vm.current.messages.isNotEmpty(), onClick = { chatMenu = false; onRename(vm.current) })
+                            DropdownMenuItem(text = { Text("New chat") }, onClick = { chatMenu = false; vm.newChat(vm.current.projectId) })
+                            DropdownMenuItem(text = { Text("Delete chat") }, enabled = vm.current.messages.isNotEmpty(), onClick = { chatMenu = false; vm.delete(vm.current.id) })
+                        }
                     }
                 },
                 actions = {
                     TerminalButton(vm)
+                    IconButton(onClick = onDetails) {
+                        Icon(Icons.Default.ViewSidebar, if (detailsOpen) "Hide details" else "Show details",
+                            tint = if (detailsOpen) MaterialTheme.colorScheme.primary else androidx.compose.material3.LocalContentColor.current)
+                    }
                     if (showSettings) IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Settings") }
                 },
             )
         },
     ) { pad ->
-        Column(Modifier.padding(pad).fillMaxSize().imePadding()) {
+        // On wide screens the conversation keeps a comfortable reading width, centred.
+        Box(Modifier.padding(pad).fillMaxSize().imePadding(), contentAlignment = Alignment.TopCenter) {
+        Column(Modifier.widthIn(max = 860.dp).fillMaxSize()) {
             val msgs = vm.current.messages
             Box(Modifier.weight(1f)) {
                 when {
@@ -176,7 +187,10 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
             val footer = parts.takeIf { it.isNotEmpty() }?.let { if (vm.rotation.size > 1 && chatProvider != null) listOf("${chatProvider.name}:") + it else it }
             val exhausted = lim != null && ((lim.perMinute > 0 && minLeft == 0) || (lim.perDay > 0 && dayLeft == 0))
             Composer(enabled = provider != null, streaming = vm.streaming, onSend = send, onStop = vm::stop, footer = footer, footerWarn = exhausted,
+                model = chatProvider?.let { it.model.ifBlank { "No model set" } }, modelSub = chatProvider?.let { cp ->
+                    listOfNotNull(vm.currentAgent?.name, cp.name, "Unrestricted".takeIf { vm.settings.unrestricted }).joinToString(" · ") }, onPickModel = onPickModel,
                 pending = vm.pendingAttachments, attaching = vm.attaching, onAttach = vm::addAttachments, onRemove = vm::removePending)
+        }
         }
         // Terminal window floats over the chat; minimized it's just the top-bar button and the programs keep running.
         if (vm.terminalOpen) Box(Modifier.padding(pad).fillMaxSize().imePadding()) { TerminalWindow(vm) }
@@ -246,7 +260,8 @@ private fun ToolRun(msgs: List<ChatMessage>, results: Map<String?, ChatMessage>,
         Row(Modifier.clip(RoundedCornerShape(8.dp)).clickable { open = !open }.padding(vertical = 4.dp, horizontal = 2.dp), verticalAlignment = Alignment.CenterVertically) {
             if (active) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp) else Icon(Icons.Default.Build, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.size(8.dp))
-            Text((if (active) "Working · " else "Ran ") + "${calls.size} step${if (calls.size == 1) "" else "s"}" +
+            val noun = if (calls.all { it.name == "run_command" }) "command" else "step"
+            Text((if (active) "Working · " else "Ran ") + "${calls.size} $noun${if (calls.size == 1) "" else "s"}" +
                 (if (failed > 0) " · $failed failed" else "") + " · " + calls.joinToString(", ") { toolTitle(it.name) }.take(60),
                 style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f, fill = false))
@@ -425,6 +440,7 @@ private val OCTOPUS = listOf(
 
 @Composable
 private fun Composer(enabled: Boolean, streaming: Boolean, onSend: (String, Boolean) -> Unit, onStop: () -> Unit, footer: List<String>? = null, footerWarn: Boolean = false,
+                     model: String? = null, modelSub: String? = null, onPickModel: () -> Unit = {},
                      pending: List<app.switchboard.data.Attachment> = emptyList(), attaching: Boolean = false,
                      onAttach: (List<android.net.Uri>) -> Unit = {}, onRemove: (app.switchboard.data.Attachment) -> Unit = {}) {
     var text by rememberSaveable { mutableStateOf("") }
@@ -437,8 +453,10 @@ private fun Composer(enabled: Boolean, streaming: Boolean, onSend: (String, Bool
     }
     // Any file type, several at once.
     val pick = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenMultipleDocuments()) { onAttach(it) }
-    Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)) {
-      Column(Modifier.fillMaxWidth().navigationBarsPadding()) {
+    Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 4.dp)) {
+      Surface(color = MaterialTheme.colorScheme.surface, shape = RoundedCornerShape(24.dp),
+          border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)), shadowElevation = 1.dp) {
+      Column(Modifier.fillMaxWidth()) {
         if (pending.isNotEmpty() || attaching) androidx.compose.foundation.lazy.LazyRow(
             contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 10.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             items(pending, key = { it.path }) { a ->
@@ -449,8 +467,8 @@ private fun Composer(enabled: Boolean, streaming: Boolean, onSend: (String, Bool
             }
             if (attaching) item { CircularProgressIndicator(Modifier.padding(8.dp).size(18.dp), strokeWidth = 2.dp) }
         }
-        Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 12.dp, bottom = if (footer != null) 4.dp else 12.dp), verticalAlignment = Alignment.Bottom) {
-            IconButton(onClick = { pick.launch(arrayOf("*/*")) }, enabled = enabled && !streaming, modifier = Modifier.size(48.dp)) {
+        Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 6.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = { pick.launch(arrayOf("*/*")) }, enabled = enabled && !streaming, modifier = Modifier.size(44.dp)) {
                 Icon(Icons.Default.Add, "Attach files")
             }
             TextField(
@@ -458,8 +476,8 @@ private fun Composer(enabled: Boolean, streaming: Boolean, onSend: (String, Bool
                 placeholder = { Text("Message") }, maxLines = 6,
                 modifier = Modifier.weight(1f),
                 colors = TextFieldDefaults.colors(
-                    focusedContainerColor = MaterialTheme.colorScheme.surface, unfocusedContainerColor = MaterialTheme.colorScheme.surface,
-                    disabledContainerColor = MaterialTheme.colorScheme.surface,
+                    focusedContainerColor = androidx.compose.ui.graphics.Color.Transparent, unfocusedContainerColor = androidx.compose.ui.graphics.Color.Transparent,
+                    disabledContainerColor = androidx.compose.ui.graphics.Color.Transparent,
                     focusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
                     unfocusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
                     disabledIndicatorColor = androidx.compose.ui.graphics.Color.Transparent,
@@ -472,32 +490,41 @@ private fun Composer(enabled: Boolean, streaming: Boolean, onSend: (String, Bool
                         .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                         .putExtra(android.speech.RecognizerIntent.EXTRA_PROMPT, "Speak your message"))
                 }.onFailure { android.widget.Toast.makeText(ctx, "No speech recognizer on this phone (install Google or another voice keyboard).", android.widget.Toast.LENGTH_LONG).show() }
-            }, modifier = Modifier.size(48.dp)) { Icon(Icons.Default.Mic, "Speak your message") }
+            }, modifier = Modifier.size(44.dp)) { Icon(Icons.Default.Mic, "Speak your message") }
             Spacer(Modifier.size(4.dp))
             if (streaming) {
-                FilledIconButton(onClick = onStop, modifier = Modifier.size(48.dp)) { Icon(Icons.Default.Stop, "Stop generating") }
+                FilledIconButton(onClick = onStop, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Stop, "Stop generating") }
             } else {
                 FilledIconButton(
-                    onClick = { onSend(text, false); text = "" }, enabled = enabled && !attaching && (text.isNotBlank() || pending.isNotEmpty()), modifier = Modifier.size(48.dp),
+                    onClick = { onSend(text, false); text = "" }, enabled = enabled && !attaching && (text.isNotBlank() || pending.isNotEmpty()), modifier = Modifier.size(40.dp),
                     colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.primary),
                 ) { Icon(Icons.Default.ArrowUpward, "Send") }
             }
         }
-        // Each piece stays on one line and the pieces line up on the right, wrapping as whole pieces on narrow screens.
-        footer?.let { pieces ->
-            @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
-            androidx.compose.foundation.layout.FlowRow(
-                Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 8.dp)
-                    .semantics(mergeDescendants = true) { contentDescription = "Requests remaining: ${pieces.joinToString(" ")}" },
-                horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End),
-            ) {
-                pieces.forEach { piece ->
-                    Text(piece, style = MaterialTheme.typography.labelSmall, maxLines = 1, softWrap = false,
-                        color = if (footerWarn) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+      }
+      }
+        // Under the box: the model in use (tap to switch) and the request limits. Pieces wrap whole, lined up on the right.
+        @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+        androidx.compose.foundation.layout.FlowRow(
+            Modifier.fillMaxWidth().padding(start = 4.dp, end = 4.dp, top = 2.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End), verticalArrangement = Arrangement.Center,
+        ) {
+            footer?.let { pieces ->
+                Row(Modifier.align(Alignment.CenterVertically).semantics(mergeDescendants = true) { contentDescription = "Requests remaining: ${pieces.joinToString(" ")}" },
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    pieces.forEach { piece ->
+                        Text(piece, style = MaterialTheme.typography.labelSmall, maxLines = 1, softWrap = false,
+                            color = if (footerWarn) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
             }
+            if (model != null) Row(Modifier.clip(RoundedCornerShape(8.dp)).clickable(onClick = onPickModel).padding(horizontal = 6.dp, vertical = 4.dp)
+                .semantics { contentDescription = "Model: $model. Tap to switch" }, verticalAlignment = Alignment.CenterVertically) {
+                Text(model, style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 220.dp))
+                modelSub?.let { Text("  $it", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 200.dp)) }
+                Icon(Icons.Default.ExpandMore, null, Modifier.size(16.dp))
+            }
         }
-      }
     }
 }
 
