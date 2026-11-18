@@ -46,6 +46,64 @@ object LocalEngine {
     /** "Loading model…" while starting, the loaded model's name while running, null when stopped. */
     val status: StateFlow<String?> = _status
 
+    /** What the engine is doing, for the progress bar. */
+    enum class Phase { LOADING, READING, WRITING, IDLE }
+
+    /**
+     * [residentBytes] is how much of the model file is actually in memory right now (it grows while a model loads, and
+     * for MoE / bigger-than-memory models while it reads weights from storage). [promptDone]/[promptTotal] is the prompt
+     * being read (tokens), [tokensPerSec] the writing speed.
+     */
+    data class Progress(
+        val phase: Phase, val name: String, val modelBytes: Long, val residentBytes: Long = 0, val large: Boolean = false,
+        val promptDone: Int = 0, val promptTotal: Int = 0, val tokens: Int = 0, val tokensPerSec: Double = 0.0,
+    ) {
+        val memoryFraction get() = if (modelBytes > 0) (residentBytes.toDouble() / modelBytes).coerceIn(0.0, 1.0) else 0.0
+        val promptFraction get() = if (promptTotal > 0) (promptDone.toDouble() / promptTotal).coerceIn(0.0, 1.0) else 0.0
+    }
+
+    private val _progress = MutableStateFlow<Progress?>(null)
+    val progress: StateFlow<Progress?> = _progress
+    private var monitorJob: Job? = null
+    @Volatile private var writeStart = 0L
+
+    /** A chat request to the local model began (the server reads the prompt first). */
+    fun requestStarted() { touch(); _progress.value = _progress.value?.copy(phase = Phase.READING, promptDone = 0, promptTotal = 0, tokens = 0, tokensPerSec = 0.0) }
+
+    /** From the server's prompt_progress updates: [done] of [total] prompt tokens read (cached ones count as read). */
+    fun promptProgress(done: Int, total: Int) { touch(); _progress.value = _progress.value?.copy(phase = Phase.READING, promptDone = done, promptTotal = total) }
+
+    /** One more piece of the reply arrived (about one token). */
+    fun tokenArrived() {
+        touch()
+        val cur = _progress.value ?: return
+        val now = System.currentTimeMillis()
+        if (cur.phase != Phase.WRITING) writeStart = now
+        val n = if (cur.phase != Phase.WRITING) 1 else cur.tokens + 1
+        val secs = (now - writeStart) / 1000.0
+        _progress.value = cur.copy(phase = Phase.WRITING, promptDone = cur.promptTotal, tokens = n, tokensPerSec = if (secs > 0.5) (n - 1) / secs else cur.tokensPerSec)
+    }
+
+    fun requestEnded() { _progress.value = _progress.value?.copy(phase = Phase.IDLE) }
+
+    /** Bytes of the model file mapped into the engine's memory (RssFile in /proc), or -1 if unknown. */
+    private fun residentOf(pid: Long): Long = runCatching {
+        File("/proc/$pid/status").readLines().firstOrNull { it.startsWith("RssFile:") }
+            ?.substringAfter(':')?.trim()?.substringBefore(' ')?.toLong()?.times(1024) ?: -1L
+    }.getOrDefault(-1L)
+
+    /** Polls how much of the model is in memory while the engine runs (twice a second while busy, slower when idle). */
+    private fun startMonitor(p: Process, pid: Long) {
+        monitorJob?.cancel()
+        monitorJob = scope.launch {
+            while (isActive && p.isAlive) {
+                val r = residentOf(pid)
+                if (r >= 0) _progress.value = _progress.value?.let { it.copy(residentBytes = minOf(r, it.modelBytes)) }
+                delay(if (_progress.value?.phase == Phase.IDLE) 3000 else 500)
+            }
+        }
+    }
+
     val baseUrl get() = "http://127.0.0.1:$PORT/v1"
     val isRunning get() = proc?.isAlive == true
 
@@ -82,6 +140,7 @@ object LocalEngine {
         killStale()
         synchronized(log) { log.clear() }
         _status.value = "Loading $name…"
+        _progress.value = Progress(Phase.LOADING, name, File(key.path).length(), large = key.large)
         val args = mutableListOf(bin.path, "-m", key.path, "--host", "127.0.0.1", "--port", "$PORT", "-c", "${key.ctx}", "-np", "1",
             "--jinja", "--api-key", key.apiKey, "--no-webui", "-a", name)
         if (key.threads > 0) args += listOf("-t", "${key.threads}")
@@ -90,7 +149,9 @@ object LocalEngine {
         bin.parentFile?.let { pb.environment()["LD_LIBRARY_PATH"] = it.path }
         val p = try { pb.start() } catch (e: Exception) { _status.value = null; throw ApiException("Couldn't start the local model engine: ${e.message}") }
         proc = p; running = key
-        runCatching { stateDir?.let { File(it, "llama-server.pid").writeText(pidOf(p).toString()) } }
+        val pid = pidOf(p)
+        runCatching { stateDir?.let { File(it, "llama-server.pid").writeText(pid.toString()) } }
+        if (pid > 0) startMonitor(p, pid)
         Thread {
             p.inputStream.bufferedReader().forEachLine { line -> synchronized(log) { log.addLast(line); while (log.size > 200) log.removeFirst() } }
         }.apply { isDaemon = true }.start()
@@ -98,7 +159,7 @@ object LocalEngine {
         val deadline = System.currentTimeMillis() + 15 * 60_000
         while (true) {
             if (!p.isAlive) {
-                proc = null; running = null; _status.value = null
+                proc = null; running = null; _status.value = null; _progress.value = null
                 throw ApiException("The local model stopped while loading (exit ${p.exitValue()}). " + explain(recentLog(25), p.exitValue()))
             }
             if (healthy(key.apiKey)) break
@@ -106,6 +167,7 @@ object LocalEngine {
             delay(300)
         }
         _status.value = name
+        _progress.value = _progress.value?.copy(phase = Phase.IDLE)
         startIdleWatch()
     }
 
@@ -152,6 +214,7 @@ object LocalEngine {
             if (!p.waitFor(3, TimeUnit.SECONDS)) p.destroyForcibly()
         }
         proc = null; running = null; _status.value = null
+        monitorJob?.cancel(); monitorJob = null; _progress.value = null
         runCatching { stateDir?.let { File(it, "llama-server.pid").delete() } }
     }
 
@@ -165,7 +228,15 @@ object LocalEngine {
         Thread.sleep(300)
     }
 
-    private fun pidOf(p: Process): Long = runCatching { p.javaClass.getMethod("pid").invoke(p) as Long }.getOrElse {
-        runCatching { p.javaClass.getDeclaredField("pid").apply { isAccessible = true }.getInt(p).toLong() }.getOrDefault(-1)
+    private fun pidOf(p: Process): Long = runCatching { Process::class.java.getMethod("pid").invoke(p) as Long }.getOrElse {
+        runCatching { p.javaClass.getDeclaredField("pid").apply { isAccessible = true }.getInt(p).toLong() }.getOrElse { findEnginePid() }
+    }
+
+    /** Last resort (older Android): find our engine in /proc by its command line (same user, so readable). */
+    private fun findEnginePid(): Long {
+        val bin = binary?.path ?: return -1
+        return File("/proc").listFiles()?.asSequence()?.mapNotNull { it.name.toLongOrNull() }?.firstOrNull { pid ->
+            runCatching { File("/proc/$pid/cmdline").readText() }.getOrNull()?.let { it.startsWith(bin) && "--port\u0000$PORT" in it } == true
+        } ?: -1
     }
 }

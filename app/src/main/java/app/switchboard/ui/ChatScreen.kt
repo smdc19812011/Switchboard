@@ -151,8 +151,10 @@ fun ChatScreen(vm: ChatViewModel, onMenu: () -> Unit, onSettings: () -> Unit, on
                     }
                 }
             }
-            val localStatus by app.switchboard.local.LocalEngine.status.collectAsState()
-            (vm.toolStatus ?: localStatus?.takeIf { vm.streaming && it.startsWith("Loading") }?.let { "$it (loading a local model can take a minute)" })?.let {
+            // The on-phone model's progress: loading into memory, reading the message, writing, and how much is in memory.
+            val localProgress by app.switchboard.local.LocalEngine.progress.collectAsState()
+            localProgress?.takeIf { vm.streaming && it.phase != app.switchboard.local.LocalEngine.Phase.IDLE }?.let { LocalProgressBar(it) }
+            vm.toolStatus?.let {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                     CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp); Spacer(Modifier.size(8.dp))
                     Text(it, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)

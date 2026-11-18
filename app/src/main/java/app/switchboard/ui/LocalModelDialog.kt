@@ -225,7 +225,9 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
                 }) { Text("Load now to test") }
                 if (status != null && testNote?.startsWith("Loading") != true) TextButton(onClick = { vm.unloadLocal(); testNote = "Unloaded." }) { Text("Unload") }
             }
-            (testNote ?: status?.let { if (it.startsWith("Loading")) it else "Loaded now: $it" })?.let {
+            val pr by LocalEngine.progress.collectAsState()
+            pr?.takeIf { it.phase != LocalEngine.Phase.IDLE }?.let { LocalProgressBar(it, Modifier.padding(0.dp)) }
+            (testNote?.takeUnless { it.startsWith("Loading") && pr != null } ?: status?.let { if (it.startsWith("Loading")) null else "Loaded now: $it" + (pr?.let { p -> " · ${ModelFiles.human(p.residentBytes)} in memory" } ?: "") })?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = if (it.startsWith("Couldn't")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
             }
             if (!isNew && path.isNotBlank() && file.parentFile?.canonicalPath == vm.modelsDir().canonicalPath && file.exists())

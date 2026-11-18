@@ -113,6 +113,7 @@ class ChatClient {
         }
         checkTransport(request, opts.unrestricted)
         val call = http.newCall(request)
+        if (p.local != null) app.switchboard.local.LocalEngine.requestStarted()
         // The blocking read runs in a child; awaitClose is registered right away, so Stop cancels the call immediately.
         launch(Dispatchers.IO) {
             try {
@@ -130,8 +131,16 @@ class ChatClient {
                         val data = line.removePrefix("data:").trim()
                         if (data == "[DONE]") break
                         val obj = runCatching { json.parseToJsonElement(data).jsonObject }.getOrNull() ?: continue
-                        acc.accept(obj)?.let { trySend(StreamEvent.TextDelta(it)) }
-                        acc.takeThinking()?.let { trySend(StreamEvent.ThinkingDelta(it)) }
+                        if (p.local != null) (obj["prompt_progress"] as? JsonObject)?.let { pp ->
+                            val total = pp.str("total")?.toIntOrNull() ?: 0
+                            val done = (pp.str("cache")?.toIntOrNull() ?: 0) + (pp.str("processed")?.toIntOrNull() ?: 0)
+                            app.switchboard.local.LocalEngine.promptProgress(done.coerceAtMost(total), total)
+                        }
+                        val text = acc.accept(obj)
+                        val thought = acc.takeThinking()
+                        if (p.local != null && (text != null || thought != null || obj.toString().contains("\"tool_calls\""))) app.switchboard.local.LocalEngine.tokenArrived()
+                        text?.let { trySend(StreamEvent.TextDelta(it)) }
+                        thought?.let { trySend(StreamEvent.ThinkingDelta(it)) }
                     }
                     trySend(acc.finish())
                 }
@@ -140,7 +149,7 @@ class ChatClient {
                 close(if (call.isCanceled()) null else e)
             }
         }
-        awaitClose { call.cancel() }
+        awaitClose { call.cancel(); if (p.local != null) app.switchboard.local.LocalEngine.requestEnded() }
     }.flowOn(Dispatchers.IO)
 
     suspend fun listModels(p: Provider, unrestricted: Boolean = false): List<String> = listModelsDetailed(p, unrestricted).map { it.id }
@@ -279,6 +288,8 @@ class ChatClient {
     internal fun openAiBody(p: Provider, msgs: List<ChatMessage>, opts: RequestOptions): JsonObject = buildJsonObject {
         put("model", p.model)
         put("stream", true)
+        // The local engine reports how far it has read the prompt (for the progress bar).
+        if (p.local != null) put("return_progress", true)
         if (opts.unrestricted) put("max_tokens", opts.maxTokens)
         if (opts.tools.isNotEmpty()) putJsonArray("tools") {
             for (t in opts.tools) addJsonObject {

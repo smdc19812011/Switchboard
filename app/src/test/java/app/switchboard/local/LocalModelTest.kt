@@ -11,6 +11,7 @@ import app.switchboard.net.RequestOptions
 import app.switchboard.net.StreamEvent
 import app.switchboard.net.ToolSpec
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -75,12 +76,22 @@ class LocalModelTest {
             local = LocalModel(path = model!!.path, contextSize = 2048, keepMinutes = 5))
         try {
             assertEquals("tiny", ChatClient().listModels(p).single())
+            // Record what the status bar would show while the model loads and answers.
+            val seen = java.util.Collections.synchronizedList(mutableListOf<LocalEngine.Progress>())
+            val watcher = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch { LocalEngine.progress.collect { it?.let(seen::add) } }
             val tool = ToolSpec("get_time", "Get the time", buildJsonObject { put("type", "object") })
             val events = ChatClient().stream(p, listOf(ChatMessage(role = Role.USER, text = "Hello")),
                 RequestOptions(system = "Be brief.", maxTokens = 16, tools = listOf(tool))).toList()
             val end = events.last() as StreamEvent.TurnEnd
             assertTrue(events.any { it is StreamEvent.TextDelta } || end.toolCalls.isNotEmpty())
             assertTrue(LocalEngine.isRunning && LocalEngine.status.value == "tiny")
+            kotlinx.coroutines.delay(1200) // let the memory monitor take a reading
+            watcher.cancel()
+            assertTrue(seen.toString(), seen.any { it.phase == LocalEngine.Phase.LOADING && it.modelBytes == model.length() })
+            assertTrue(seen.toString(), seen.any { it.phase == LocalEngine.Phase.READING && it.promptTotal > 0 && it.promptDone <= it.promptTotal })
+            assertTrue(seen.toString(), seen.any { it.phase == LocalEngine.Phase.WRITING && it.tokens > 0 })
+            assertEquals(LocalEngine.Phase.IDLE, LocalEngine.progress.value!!.phase)
+            assertTrue("resident ${LocalEngine.progress.value}", LocalEngine.progress.value!!.residentBytes > 0)
             // Bigger-than-memory mode restarts the engine with its options and still answers. This tiny model's head size (16)
             // can't use the 8-bit cache, so this also covers the automatic retry with the normal cache.
             val large = p.copy(local = p.local!!.copy(largeMode = true))

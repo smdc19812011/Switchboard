@@ -77,6 +77,12 @@ Settings > Add provider > **Local model (GGUF on this phone)** runs a model on t
   - work buffers are smaller and the context defaults to 4096
 
   It's slower, and dense models that don't fit are still flagged, because every token needs all of their weights.
+- **Status bar**: while a local model works, the chat shows what it's doing:
+  - loading into memory (GB loaded and a percentage)
+  - reading your message (tokens read, from the engine's own progress reports)
+  - writing (tokens per second)
+
+  A thin second bar shows how much of the model is in memory right now, read from `/proc`. That's the useful number for MoE and bigger-than-memory models, which read weights from storage as they go. "Load now to test" shows the same bar.
 - It needs a 64-bit ARM phone. Small models (1–4B parameters, Q4_K_M) are the practical size, and a model needs a bit more free memory than its file size. The engine is rebuilt with `tools/build-llama-server.sh`.
 
 ## Build Android apps on the phone (no Termux)
