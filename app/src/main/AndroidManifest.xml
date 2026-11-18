@@ -63,6 +63,11 @@
                 <data android:scheme="switchboard" android:host="oauth" />
             </intent-filter>
         </activity>
+        <!-- The llama.cpp engine for local models, in its own process so running out of memory stops it, not the app. -->
+        <service
+            android:name=".EngineService"
+            android:process=":engine"
+            android:exported="false" />
         <service
             android:name=".WorkService"
             android:exported="false"

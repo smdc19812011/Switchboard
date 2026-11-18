@@ -148,7 +148,9 @@ class ChatClient {
                 }
                 close()
             } catch (e: Exception) {
-                close(if (call.isCanceled()) null else e)
+                // A local engine that died mid-reply (e.g. stopped by Android for memory): say that instead of "connection reset".
+                val why = if (p.local != null) app.switchboard.local.LocalEngine.whyStopped() else null
+                close(if (call.isCanceled()) null else why?.let { ApiException(it) } ?: e)
             }
         }
         awaitClose { call.cancel(); if (p.local != null) app.switchboard.local.LocalEngine.requestEnded() }

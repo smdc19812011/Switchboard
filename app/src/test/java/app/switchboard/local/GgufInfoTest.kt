@@ -49,8 +49,9 @@ class GgufInfoTest {
         val gb = 1L shl 30; val ram = 12 * gb
         assertEquals(Fit.FITS, Fit.of(3 * gb, ram, false))
         assertEquals(Fit.TOO_BIG, Fit.of(17 * gb, ram, false))
-        assertEquals(Fit.BIG_MOE, Fit.of(17 * gb, ram, true))
-        assertEquals(Fit.BIG_MOE, Fit.of(20 * gb, ram, true))
+        assertEquals(Fit.BIG_MOE, Fit.of(10 * gb, ram, true))
+        assertEquals(Fit.BIG_MOE, Fit.of(14 * gb, ram, true))
+        assertEquals(Fit.TOO_BIG, Fit.of(17 * gb, ram, true))
         assertEquals(Fit.TOO_BIG, Fit.of(30 * gb, ram, true))
         assertTrue(Fit.wantsLargeMode(8 * gb, ram)); assertFalse(Fit.wantsLargeMode(4 * gb, ram))
     }

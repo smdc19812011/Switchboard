@@ -28,16 +28,17 @@ object LocalEngine {
     /** Set at startup: the llama-server executable and a folder for its pid file. */
     @Volatile var binary: File? = null
     @Volatile var stateDir: File? = null
+    /** Where the engine runs: the app sets its separate engine process (see EngineService); tests run it in-process. */
+    @Volatile var launcher: EngineLauncher = InProcessLauncher
     const val PORT = 8737
 
     private data class Key(val path: String, val ctx: Int, val threads: Int, val apiKey: String, val large: Boolean = false)
 
     private val mutex = Mutex()
-    private var proc: Process? = null
+    private var proc: EngineHandle? = null
     private var running: Key? = null
     @Volatile private var lastUsed = 0L
     @Volatile private var keepMs = 10 * 60_000L
-    private val log = ArrayDeque<String>()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var idleJob: Job? = null
     private val http = OkHttpClient.Builder().connectTimeout(2, TimeUnit.SECONDS).readTimeout(5, TimeUnit.SECONDS).build()
@@ -93,18 +94,6 @@ object LocalEngine {
 
     fun requestEnded() { _progress.value = _progress.value?.copy(phase = Phase.IDLE, tokens = tokenCount) }
 
-    /**
-     * If memory runs out, Android should stop the engine (Switchboard then explains what happened) rather than
-     * Switchboard itself: make the engine slightly more expendable than the app. Raising it needs no permission;
-     * best effort if the system doesn't allow it.
-     */
-    private fun preferKillingEngine(pid: Long) {
-        runCatching {
-            val own = File("/proc/self/oom_score_adj").readText().trim().toInt()
-            File("/proc/$pid/oom_score_adj").writeText("${(own + 100).coerceIn(0, 1000)}")
-        }
-    }
-
     /** Bytes of the model file mapped into the engine's memory (RssFile in /proc), or -1 if unknown. */
     private fun residentOf(pid: Long): Long = runCatching {
         File("/proc/$pid/status").readLines().firstOrNull { it.startsWith("RssFile:") }
@@ -112,7 +101,7 @@ object LocalEngine {
     }.getOrDefault(-1L)
 
     /** Polls how much of the model is in memory while the engine runs (twice a second while busy, slower when idle). */
-    private fun startMonitor(p: Process, pid: Long) {
+    private fun startMonitor(p: EngineHandle, pid: Long) {
         monitorJob?.cancel()
         monitorJob = scope.launch {
             while (isActive && p.isAlive) {
@@ -129,7 +118,19 @@ object LocalEngine {
     /** Called while a reply streams, so a long answer doesn't count as idle time. */
     fun touch() { lastUsed = System.currentTimeMillis() }
 
-    fun recentLog(lines: Int = 15): String = synchronized(log) { log.takeLast(lines).joinToString("\n") }
+    fun recentLog(lines: Int = 15): String = proc?.log(lines) ?: lastLog.lines().takeLast(lines).joinToString("\n")
+    @Volatile private var lastLog = ""
+
+    /**
+     * Why the engine isn't running any more (it died during a reply, e.g. Android stopped it to free memory), for the
+     * chat's error message; null if it's running or was stopped on purpose.
+     */
+    fun whyStopped(): String? {
+        val p = proc ?: return null
+        if (p.isAlive) return null
+        val code = p.exitCode ?: -1
+        return "The local model stopped (exit $code). " + (p.stopReason()?.let { "$it " } ?: "") + explain(p.log(25), code)
+    }
 
     /** Makes sure [p]'s model is loaded and answering (starting or switching the server if needed). */
     suspend fun ensure(p: Provider) {
@@ -147,10 +148,17 @@ object LocalEngine {
         withContext(Dispatchers.IO) { mutex.withLock {
             if (running == key && proc?.isAlive == true && healthy(key.apiKey)) return@withLock
             stopLocked()
-            try { start(bin, key, p.model.ifBlank { file.name }, quantCache = key.large) }
+            val name = p.model.ifBlank { file.name }
+            try { start(bin, key, name, quantCache = key.large) }
             catch (e: ApiException) {
-                // Some models can't use the 8-bit conversation cache (head size not a multiple of 32): use the normal one.
-                if (key.large && "cache type" in recentLog(40)) start(bin, key, p.model.ifBlank { file.name }, quantCache = false) else throw e
+                val log = recentLog(40).lowercase()
+                when {
+                    // Some models can't use the 8-bit conversation cache (head size not a multiple of 32): use the normal one.
+                    key.large && "cache type" in log -> start(bin, key, name, quantCache = false)
+                    // The previous engine hadn't released the port yet.
+                    "bind" in log || "address already in use" in log -> { delay(1500); start(bin, key, name, quantCache = key.large) }
+                    else -> throw e
+                }
             }
         } }
         touch()
@@ -158,29 +166,26 @@ object LocalEngine {
 
     private suspend fun start(bin: File, key: Key, name: String, quantCache: Boolean) = withContext(Dispatchers.IO) {
         killStale()
-        synchronized(log) { log.clear() }
         _status.value = "Loading $name…"
         _progress.value = Progress(Phase.LOADING, name, File(key.path).length(), large = key.large)
         val args = mutableListOf(bin.path, "-m", key.path, "--host", "127.0.0.1", "--port", "$PORT", "-c", "${key.ctx}", "-np", "1",
             "--jinja", "--api-key", key.apiKey, "--no-webui", "-a", name)
         if (key.threads > 0) args += listOf("-t", "${key.threads}")
         args += largeModeArgs(key.large, quantCache)
-        val pb = ProcessBuilder(args).redirectErrorStream(true)
-        bin.parentFile?.let { pb.environment()["LD_LIBRARY_PATH"] = it.path }
-        val p = try { pb.start() } catch (e: Exception) { _status.value = null; throw ApiException("Couldn't start the local model engine: ${e.message}") }
+        val env = bin.parentFile?.let { mapOf("LD_LIBRARY_PATH" to it.path) }.orEmpty()
+        val p = try { launcher.start(args, env) } catch (e: Exception) { _status.value = null; _progress.value = null; throw ApiException("Couldn't start the local model engine: ${e.message}") }
         proc = p; running = key
-        val pid = pidOf(p)
+        val pid = p.pid.takeIf { it > 0 } ?: findEnginePid(bin.path, PORT)
         runCatching { stateDir?.let { File(it, "llama-server.pid").writeText(pid.toString()) } }
-        if (pid > 0) { startMonitor(p, pid); preferKillingEngine(pid) }
-        Thread {
-            p.inputStream.bufferedReader().forEachLine { line -> synchronized(log) { log.addLast(line); while (log.size > 200) log.removeFirst() } }
-        }.apply { isDaemon = true }.start()
+        if (pid > 0) startMonitor(p, pid)
         // Big models take a while to map into memory; the server answers /health with 200 once it's ready.
         val deadline = System.currentTimeMillis() + 15 * 60_000
         while (true) {
             if (!p.isAlive) {
-                proc = null; running = null; _status.value = null; _progress.value = null
-                throw ApiException("The local model stopped while loading (exit ${p.exitValue()}). " + explain(recentLog(25), p.exitValue()))
+                val code = p.exitCode ?: -1
+                val log = p.log(25)
+                proc = null; running = null; _status.value = null; _progress.value = null; lastLog = log
+                throw ApiException("The local model stopped while loading (exit $code). " + (p.stopReason()?.let { "$it\n" } ?: "") + explain(log, code))
             }
             if (healthy(key.apiKey)) break
             if (System.currentTimeMillis() > deadline) { stopLocked(); throw ApiException("The local model didn't finish loading within 15 minutes.") }
@@ -229,10 +234,7 @@ object LocalEngine {
 
     private fun stopLocked() {
         idleJob?.cancel(); idleJob = null
-        proc?.let { p ->
-            p.destroy()
-            if (!p.waitFor(3, TimeUnit.SECONDS)) p.destroyForcibly()
-        }
+        proc?.let { p -> lastLog = p.log(40); p.stop() }
         proc = null; running = null; _status.value = null
         monitorJob?.cancel(); monitorJob = null; _progress.value = null
         runCatching { stateDir?.let { File(it, "llama-server.pid").delete() } }
@@ -244,19 +246,9 @@ object LocalEngine {
         val pid = pidFile.takeIf { it.exists() }?.readText()?.trim()?.toIntOrNull() ?: return
         val cmd = runCatching { File("/proc/$pid/cmdline").readText() }.getOrNull()
         if (cmd != null && "llama-server" in cmd) runCatching { android.os.Process.killProcess(pid) }.onFailure { runCatching { ProcessBuilder("kill", "$pid").start().waitFor() } }
+        // The engine process (its own Android process) may also still be holding the port.
+        binary?.path?.let { b -> findEnginePid(b, PORT).takeIf { it > 0 }?.let { runCatching { ProcessBuilder("kill", "$it").start().waitFor() } } }
         pidFile.delete()
         Thread.sleep(300)
-    }
-
-    private fun pidOf(p: Process): Long = runCatching { Process::class.java.getMethod("pid").invoke(p) as Long }.getOrElse {
-        runCatching { p.javaClass.getDeclaredField("pid").apply { isAccessible = true }.getInt(p).toLong() }.getOrElse { findEnginePid() }
-    }
-
-    /** Last resort (older Android): find our engine in /proc by its command line (same user, so readable). */
-    private fun findEnginePid(): Long {
-        val bin = binary?.path ?: return -1
-        return File("/proc").listFiles()?.asSequence()?.mapNotNull { it.name.toLongOrNull() }?.firstOrNull { pid ->
-            runCatching { File("/proc/$pid/cmdline").readText() }.getOrNull()?.let { it.startsWith(bin) && "--port\u0000$PORT" in it } == true
-        } ?: -1
     }
 }

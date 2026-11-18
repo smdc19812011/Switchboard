@@ -41,11 +41,12 @@ object CrashReport {
             val info = am.getHistoricalProcessExitReasons(ctx.packageName, 0, 5).firstOrNull { it.processName == ctx.packageName }
             if (info != null && info.timestamp > seen) {
                 prefs.edit().putLong("seen", info.timestamp).apply()
-                val mem = "using ${"%.1f".format(info.pss / 1048576.0)} GB"
+                val kb = maxOf(info.pss, info.rss)
+                val mem = if (kb > 0) "using ${"%.1f".format(kb / 1048576.0)} GB" else "memory use not recorded"
                 val base = "Switchboard ${versionOf(ctx)} · Android ${Build.VERSION.RELEASE} (${Build.MODEL})\n${java.util.Date(info.timestamp)} · exit reason ${info.reason}, importance ${info.importance}, $mem\n${info.description.orEmpty()}"
                 report = when (info.reason) {
                     ApplicationExitInfo.REASON_LOW_MEMORY -> Report("Android closed Switchboard to free memory",
-                        "The phone ran out of memory ($mem). This usually happens while a local model loads or answers, when the model plus its context needs more memory than is free. " +
+                        "The phone ran out of memory. This usually happens while a local model loads or answers, when the model plus its context needs more memory than is free. " +
                             "Try \"Bigger than memory\" mode, a smaller context (4096), a smaller file (e.g. Q4_K_M or fewer parameters), or closing other apps.", base)
                     ApplicationExitInfo.REASON_CRASH, ApplicationExitInfo.REASON_CRASH_NATIVE -> Report("Switchboard crashed",
                         "Sorry about that. Tap Copy details and send them over so it can be fixed.", base + "\n\n" + (crash ?: "(no stack trace saved)"))

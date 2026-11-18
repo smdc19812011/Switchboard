@@ -79,7 +79,9 @@ enum class Fit { FITS, BIG_MOE, TOO_BIG;
     companion object {
         fun of(size: Long, ram: Long, moe: Boolean): Fit = when {
             ram <= 0 || size < ram * 0.7 -> FITS
-            moe && size < ram * 2.0 -> BIG_MOE  // only the experts in use need to be in memory; the rest is read from storage
+            // Only the experts in use need to be in memory; the rest is read from storage. Much beyond RAM, the constant
+            // re-reading makes Android's low-memory killer step in, so the margin is modest.
+            moe && size < ram * 1.25 -> BIG_MOE
             else -> TOO_BIG
         }
         /** Above this, "bigger than memory" mode is worth turning on. */
