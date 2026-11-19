@@ -39,6 +39,7 @@ class HereticTest {
             val check = ProcessBuilder("python3", "check.py").directory(dir).redirectErrorStream(true).start().inputStream.bufferedReader().readText()
             assertTrue(check, check.startsWith("HERETIC_CHECK {") && check.contains("\"heretic\": false"))
             File(dir, "export.py").writeText(Heretic.exportScript)
+            assertEquals(0, ProcessBuilder("python3", "-m", "py_compile", "export.py").directory(dir).start().waitFor()) // the whole script parses
             val p = ProcessBuilder("python3", "export.py", "out/missing-heretic", "q8_0").directory(dir).redirectErrorStream(true).start()
             val out = p.inputStream.bufferedReader().readText()
             assertTrue(out, p.waitFor() != 0 && out.contains("No saved model in out/missing-heretic"))

@@ -81,18 +81,44 @@ object Heretic {
         print("HERETIC_CHECK " + json.dumps(r))
     """.trimIndent()
 
-    /** Turns a saved Heretic model folder into a GGUF with llama.cpp's converter (fetched once into tools/llama.cpp). */
+    /**
+     * Turns a saved Heretic model folder into a GGUF with llama.cpp (fetched once into tools/llama.cpp). Q8_0/BF16/F16/F32
+     * come straight from the converter; other types (Q4_K_M, …, to match the phone's original file) go through BF16 and
+     * llama-quantize, built once with CMake; without CMake it falls back to Q8_0 and says so.
+     */
     val exportScript = """
-        import os, subprocess, sys
-        src, outtype = sys.argv[1], sys.argv[2]
+        import glob, os, shutil, subprocess, sys
+        src, outtype = sys.argv[1].rstrip("/\\"), sys.argv[2].upper()
         if not os.path.isfile(os.path.join(src, "config.json")):
             sys.exit("No saved model in " + src + " (it needs config.json and the weights). Did the Heretic run finish and save?")
         lc = os.path.join("tools", "llama.cpp")
         if not os.path.isdir(lc):
             subprocess.check_call(["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp", lc])
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-r", os.path.join(lc, "requirements", "requirements-convert_hf_to_gguf.txt")])
-        out = src.rstrip("/\\") + "-" + outtype.upper() + ".gguf"
-        subprocess.check_call([sys.executable, os.path.join(lc, "convert_hf_to_gguf.py"), src, "--outtype", outtype, "--outfile", out])
+        def convert(kind, out):
+            subprocess.check_call([sys.executable, os.path.join(lc, "convert_hf_to_gguf.py"), src, "--outtype", kind, "--outfile", out])
+        direct = {"Q8_0": "q8_0", "BF16": "bf16", "F16": "f16", "F32": "f32"}
+        out = src + "-" + outtype + ".gguf"
+        if outtype in direct:
+            convert(direct[outtype], out)
+        else:
+            def quantizer():
+                found = glob.glob(os.path.join(lc, "build", "bin", "**", "llama-quantize*"), recursive=True)
+                return next((f for f in found if os.path.isfile(f) and os.access(f, os.X_OK)), None)
+            q = quantizer()
+            if q is None and shutil.which("cmake"):
+                subprocess.check_call(["cmake", "-S", lc, "-B", os.path.join(lc, "build"), "-DLLAMA_CURL=OFF", "-DLLAMA_OPENSSL=OFF", "-DLLAMA_BUILD_TESTS=OFF", "-DLLAMA_BUILD_SERVER=OFF"])
+                subprocess.check_call(["cmake", "--build", os.path.join(lc, "build"), "--config", "Release", "--target", "llama-quantize", "-j"])
+                q = quantizer()
+            if q is None:
+                print("QUANT_FALLBACK cmake isn't installed on this computer, so " + outtype + " can't be made; using Q8_0 instead")
+                out = src + "-Q8_0.gguf"
+                convert("q8_0", out)
+            else:
+                tmp = src + "-BF16.tmp.gguf"
+                convert("bf16", tmp)
+                subprocess.check_call([q, tmp, out, outtype])
+                os.remove(tmp)
         print("GGUF_OUT " + os.path.abspath(out))
     """.trimIndent()
 

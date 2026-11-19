@@ -126,6 +126,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpen: (String) -> Un
                         val transfers by app.switchboard.local.ModelDownloads.all.collectAsState()
                         val t = p.local?.let { transfers[it.path] }?.takeIf { it.active || it.error != null }
                         Text(p.local?.let { lm -> "On this phone · ${java.io.File(lm.path).name.ifBlank { "no model file yet" }}" +
+                            (if (lm.hereticState.startsWith("running")) " · Heretic: working" else "") +
                             (t?.let { if (it.error != null) " · download failed (edit to retry)" else " · downloading" + (if (it.percent >= 0) " ${it.percent}%" else "…") } ?: "") }
                             ?: "${p.model.ifBlank { "no model" }} · ${p.baseUrl}", maxLines = 2)
                     },

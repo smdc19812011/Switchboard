@@ -43,6 +43,19 @@ class GgufInfoTest {
         assertEquals(null, GgufInfo.read("not a model".byteInputStream()).architecture)
     }
 
+    /** A header written by llama.cpp's own gguf library with its official key names (source model, file type). */
+    @Test fun readsSourceRepoAndQuantization() {
+        val info = GgufInfo.read(java.io.File("src/test/resources/source-q4km.gguf").inputStream())
+        assertEquals("qwen3", info.architecture)
+        assertEquals("Qwen/Qwen3-4B-Instruct-2507", info.sourceRepo)
+        assertEquals("Q4_K_M", info.quantName)
+        assertEquals("Qwen/Qwen3-4B", GgufInfo.hfRepo("https://huggingface.co/Qwen/Qwen3-4B/tree/main"))
+        assertEquals(null, GgufInfo.hfRepo("https://huggingface.co/datasets/x/y"))
+        assertEquals("unsloth/Qwen3-4B-Instruct-2507", GgufInfo.guessSourceFromLink("https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"))
+        assertEquals(null, GgufInfo.guessSourceFromLink("https://huggingface.co/Qwen/Qwen3-4B/resolve/main/x.gguf"))
+        assertEquals(-1, GgufInfo.read(header("llama", 0, 0).inputStream()).fileType) // older files without it
+    }
+
     @Test fun moeNamesAndFit() {
         listOf("Qwen3-30B-A3B-Q4_K_M.gguf", "Mixtral-8x7B-Instruct", "gpt-oss-20b-GGUF", "unsloth/Qwen3-235B-A22B-GGUF", "OLMoE-1B-7B").forEach { assertTrue(it, GgufInfo.looksMoe(it)) }
         listOf("Llama-3.2-3B-Instruct-Q4_K_M.gguf", "gemma-3-4b-it", "Qwen2.5-7B").forEach { assertFalse(it, GgufInfo.looksMoe(it)) }

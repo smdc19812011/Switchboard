@@ -151,6 +151,18 @@ private fun HereticSetup(vm: ChatViewModel) {
     Text("Converts heretic/out/${app.switchboard.engine.Heretic.outName(model)} to GGUF with llama.cpp on the computer, downloads it and adds it as a local model.",
         style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     vm.hereticStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+
+    Text("4. Use it on your local models automatically", style = MaterialTheme.typography.titleSmall)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("Heretic for local models", style = MaterialTheme.typography.bodyMedium)
+            Text("Each local GGUF model is processed with the goal above and replaced by its Heretic version, in the same quantization (the original is kept to switch back). " +
+                "Heretic works on the original Hugging Face model, found from the GGUF's header or download link; one model at a time, each can take an hour or more on the computer.",
+                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Switch(checked = h.autoLocal, onCheckedChange = { on -> vm.updateHeretic { it.copy(autoLocal = on) } })
+    }
+    vm.settings.providers.filter { it.local != null }.forEach { p -> LocalHereticRow(vm, p) }
     Text("Heretic by Philipp Emanuel Weidmann (AGPL-3.0), github.com/p-e-w/heretic: installed on your computer from PyPI, not bundled with Switchboard.",
         style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
@@ -232,6 +244,36 @@ private fun ModelPicker(label: String, models: List<Studio.Model>, selected: Str
                         onClick = { menu = false; onPick(m.id) })
                 }
             }
+        }
+    }
+}
+
+/** One local model's automatic Heretic status, with what can be done about it. */
+@Composable
+private fun LocalHereticRow(vm: ChatViewModel, p: app.switchboard.data.Provider) {
+    val lm = p.local ?: return
+    val state = lm.hereticState
+    var source by remember(p.id) { mutableStateOf(lm.hereticSource) }
+    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(p.name, style = MaterialTheme.typography.bodyMedium)
+        Text(when {
+            state == "done" -> "Using the Heretic version" + (lm.hereticSource.takeIf { it.isNotBlank() }?.let { " (from $it)" } ?: "")
+            state == "original" -> "Using the original file"
+            state == "needs-source" -> "Which Hugging Face model is this GGUF made from? Its header doesn't say."
+            state.startsWith("running") -> state.removePrefix("running: ").replaceFirstChar { it.uppercase() } + "…"
+            state.startsWith("failed") -> "Failed: " + state.removePrefix("failed: ")
+            !vm.settings.heretic.autoLocal -> "Not processed (turn on the switch above)"
+            else -> "Waiting its turn"
+        }, style = MaterialTheme.typography.labelSmall,
+            color = if (state.startsWith("failed") || state == "needs-source") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+        when {
+            state == "needs-source" || state.startsWith("failed") -> Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(source, { source = it.trim() }, label = { Text("Original model") }, placeholder = { Text("e.g. Qwen/Qwen3-4B-Instruct-2507") },
+                    singleLine = true, modifier = Modifier.weight(1f))
+                FilledTonalButton(enabled = source.isNotBlank(), onClick = { vm.hereticRequeue(p.id, source) }) { Text(if (state.startsWith("failed")) "Retry" else "Process") }
+            }
+            state == "done" -> OutlinedButton(onClick = { vm.hereticUseOriginal(p.id, true) }) { Text("Use original") }
+            state == "original" && lm.hereticPath.isNotBlank() -> OutlinedButton(onClick = { vm.hereticUseOriginal(p.id, false) }) { Text("Use Heretic version") }
         }
     }
 }

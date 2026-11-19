@@ -10,7 +10,19 @@ import java.nio.ByteOrder
  * What a GGUF file's header says about the model. Read from the start of the file only, so it also works on the first
  * couple of megabytes of a file that hasn't been downloaded (a ranged request to Hugging Face).
  */
-data class GgufInfo(val architecture: String? = null, val name: String? = null, val expertCount: Int = 0, val expertUsed: Int = 0, val contextLength: Int = 0) {
+data class GgufInfo(
+    val architecture: String? = null, val name: String? = null, val expertCount: Int = 0, val expertUsed: Int = 0, val contextLength: Int = 0,
+    /** llama.cpp's general.file_type (quantization), or -1. */
+    val fileType: Int = -1,
+    /** Links the converter recorded: base model repo, source repo, ... (in order of usefulness). */
+    val sourceUrls: List<String> = emptyList(),
+) {
+    /** The Hugging Face repo this GGUF was converted from ("org/name"), if its header says. */
+    val sourceRepo: String? get() = sourceUrls.firstNotNullOfOrNull { hfRepo(it) }
+
+    /** The quantization as llama-quantize names it ("Q4_K_M"), or null when unknown. */
+    val quantName: String? get() = QUANTS[fileType]
+
     /** Mixture of Experts: each token only uses [expertUsed] of [expertCount] experts, so the model can run larger than RAM. */
     val isMoe get() = expertCount > 1
 
@@ -19,6 +31,7 @@ data class GgufInfo(val architecture: String? = null, val name: String? = null, 
         fun read(input: InputStream): GgufInfo {
             val d = Le(DataInputStream(input.buffered(64 * 1024)))
             val kv = mutableMapOf<String, Any>()
+            val urlKeys = listOf("general.base_model.0.repo_url", "general.source.repo_url", "general.source.huggingface.repository", "general.repo_url", "general.base_model.0.url", "general.source.url")
             try {
                 if (String(d.bytes(4), Charsets.ISO_8859_1) != "GGUF") return GgufInfo()
                 val version = d.u32()
@@ -30,15 +43,44 @@ data class GgufInfo(val architecture: String? = null, val name: String? = null, 
                     val v = d.value(d.u32().toInt())
                     if (v != null) kv[key] = v
                     val arch = kv["general.architecture"] as? String
-                    if (arch != null && "$arch.expert_count" in kv && "$arch.expert_used_count" in kv && "$arch.context_length" in kv) break
+                    if (arch != null && "$arch.expert_count" in kv && "$arch.expert_used_count" in kv && "$arch.context_length" in kv && "general.file_type" in kv) break
                     if (key.startsWith("tokenizer.") && arch != null && "$arch.block_count" in kv) break // arch keys come first
                 }
             } catch (_: EOFException) { // partial header: use what we have
             } catch (_: Exception) { }
             val arch = kv["general.architecture"] as? String
             fun int(k: String) = (kv["$arch.$k"] as? Number)?.toInt() ?: 0
-            return GgufInfo(arch, kv["general.name"] as? String, int("expert_count"), int("expert_used_count"), int("context_length"))
+            return GgufInfo(arch, kv["general.name"] as? String, int("expert_count"), int("expert_used_count"), int("context_length"),
+                (kv["general.file_type"] as? Number)?.toInt() ?: -1, urlKeys.mapNotNull { kv[it] as? String })
         }
+
+        /** "org/name" from a Hugging Face URL (or a bare "org/name"), else null. */
+        fun hfRepo(url: String): String? {
+            val u = url.trim().removeSuffix("/")
+            val path = when {
+                "huggingface.co/" in u -> u.substringAfter("huggingface.co/")
+                Regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$").matches(u) -> u
+                else -> return null
+            }
+            val parts = path.split('/').filter { it.isNotBlank() }
+            if (parts.size < 2 || parts[0] in setOf("datasets", "spaces")) return null
+            return "${parts[0]}/${parts[1]}"
+        }
+
+        /**
+         * Best guess at the original model for a GGUF downloaded from a "…-GGUF" repo (unsloth/Qwen3-4B-GGUF →
+         * unsloth/Qwen3-4B), for when the header doesn't say. Shown to the user to confirm.
+         */
+        fun guessSourceFromLink(link: String): String? {
+            val repo = hfRepo(link.substringBefore("/resolve/").substringBefore("/blob/")) ?: return null
+            return if (Regex("(?i)[-_.]gguf$").containsMatchIn(repo)) repo.replace(Regex("(?i)[-_.]gguf$"), "") else null
+        }
+
+        /** llama.cpp file types (general.file_type) by the name llama-quantize uses. */
+        val QUANTS = mapOf(0 to "F32", 1 to "F16", 2 to "Q4_0", 3 to "Q4_1", 7 to "Q8_0", 8 to "Q5_0", 9 to "Q5_1", 10 to "Q2_K", 11 to "Q3_K_S",
+            12 to "Q3_K_M", 13 to "Q3_K_L", 14 to "Q4_K_S", 15 to "Q4_K_M", 16 to "Q5_K_S", 17 to "Q5_K_M", 18 to "Q6_K", 19 to "IQ2_XXS", 20 to "IQ2_XS",
+            21 to "Q2_K_S", 22 to "IQ3_XS", 23 to "IQ3_XXS", 24 to "IQ1_S", 25 to "IQ4_NL", 26 to "IQ3_S", 27 to "IQ3_M", 28 to "IQ2_S", 29 to "IQ2_M",
+            30 to "IQ4_XS", 31 to "IQ1_M", 32 to "BF16", 38 to "MXFP4_MOE")
 
         /** Guess from a name when the header isn't available (e.g. "Qwen3-30B-A3B", "Mixtral-8x7B", "gpt-oss-20b"). */
         fun looksMoe(name: String): Boolean =
