@@ -10,7 +10,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Movie
-import androidx.compose.material.icons.filled.Science
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Card
@@ -64,126 +63,6 @@ fun EmbeddedToolsPage(vm: ChatViewModel) {
         }
         if (open == "studio") Column(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             StudioSetup(vm)
-        }
-    }
-    val h = vm.settings.heretic
-    Card(Modifier.fillMaxWidth()) {
-        Row(Modifier.fillMaxWidth().clickable { open = if (open == "heretic") "" else "heretic" }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.Science, null)
-            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
-                Text("Heretic", style = MaterialTheme.typography.titleMedium)
-                Text("Modify language models on your computer (remove refusals, less slop…) · " +
-                    when { !h.enabled -> "off"; !vm.hereticOnComputer -> "needs the computer runner"; else -> "on" },
-                    style = MaterialTheme.typography.bodySmall, color = if (h.enabled && vm.hereticOnComputer) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            Switch(checked = h.enabled, onCheckedChange = { on -> vm.updateHeretic { it.copy(enabled = on) }; if (on) open = "heretic" })
-            Icon(if (open == "heretic") Icons.Default.ExpandLess else Icons.Default.ExpandMore, null, Modifier.padding(start = 8.dp))
-        }
-        if (open == "heretic") Column(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            HereticSetup(vm)
-        }
-    }
-}
-
-@Composable
-private fun HereticSetup(vm: ChatViewModel) {
-    val h = vm.settings.heretic
-    val scope = rememberCoroutineScope()
-    var check by remember { mutableStateOf<String?>(null) }
-    var model by rememberSaveable { mutableStateOf(h.lastModel.ifBlank { "Qwen/Qwen3-4B-Instruct-2507" }) }
-    var trials by rememberSaveable { mutableStateOf(h.trials.toString()) }
-    var runNote by remember { mutableStateOf<String?>(null) }
-    HorizontalDivider()
-    Text("Heretic changes a model's behaviour without training: by default it removes refusals; presets reduce slop, sycophancy or humor, or shorten answers. " +
-        "It runs on your computer (Python + PyTorch, ideally an NVIDIA GPU; a 4B model takes about 30–60 minutes), then the result can come to this phone as a local GGUF model. " +
-        "The AI can also use it (heretic_run, heretic_to_phone).", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    if (!vm.hereticOnComputer) {
-        Text("Set Settings > Tools to Computer and start runner.py on a computer with a GPU (Linux, macOS, or WSL on Windows) to use Heretic.",
-            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-        return
-    }
-    Text("1. Set up the computer", style = MaterialTheme.typography.titleSmall)
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        OutlinedButton(onClick = { check = "Checking…"; scope.launch { check = vm.hereticCheck().fold({ it }, { "Couldn't check: ${it.message}" }) } }) { Text("Check computer") }
-        FilledTonalButton(onClick = { vm.hereticInstall() }) { Text("Install / update") }
-    }
-    check?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = if (it.startsWith("Couldn't")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface) }
-
-    Text("2. Process a model", style = MaterialTheme.typography.titleSmall)
-    OutlinedTextField(model, { model = it.trim() }, label = { Text("Hugging Face model") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
-        supportingText = { Text("Model id (safetensors), e.g. Qwen/Qwen3-4B-Instruct-2507, or a folder on the computer") })
-    GoalPicker(h.goal) { g -> vm.updateHeretic { it.copy(goal = g) } }
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        OutlinedTextField(trials, { trials = it.filter(Char::isDigit).take(4) }, label = { Text("Trials") }, singleLine = true, modifier = Modifier.weight(1f),
-            supportingText = { Text("fewer = faster") })
-        Column(Modifier.weight(2f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("4-bit loading", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
-                Switch(checked = h.quant4bit, onCheckedChange = { on -> vm.updateHeretic { it.copy(quant4bit = on) } })
-            }
-            Text("Fits bigger models in less GPU memory", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text("Finish by itself", style = MaterialTheme.typography.bodyMedium)
-            Text("Pick the best result and save it to heretic/out on the computer. Off: choose in the terminal (also lets you chat with or benchmark it first).",
-                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Switch(checked = h.unattended, onCheckedChange = { on -> vm.updateHeretic { it.copy(unattended = on) } })
-    }
-    FilledTonalButton(enabled = model.isNotBlank(), onClick = {
-        runNote = "Starting…"
-        scope.launch { runNote = runCatching { vm.hereticStart(model, h.goal, h.quant4bit, trials.toIntOrNull() ?: 100, h.unattended) }
-            .fold({ "Running in the terminal window. It saves to heretic/out/${app.switchboard.engine.Heretic.outName(model)} when done." }, { "Couldn't start: ${it.message}" }) }
-    }) { Text("Start Heretic") }
-    runNote?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = if (it.startsWith("Couldn't")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface) }
-
-    Text("3. Put it on this phone", style = MaterialTheme.typography.titleSmall)
-    var fmtMenu by remember { mutableStateOf(false) }
-    androidx.compose.foundation.layout.Box {
-        OutlinedButton(onClick = { fmtMenu = true }) { Text("Format: " + (app.switchboard.engine.Heretic.exportTypes.firstOrNull { it.first == h.format }?.second ?: h.format)) }
-        DropdownMenu(expanded = fmtMenu, onDismissRequest = { fmtMenu = false }) {
-            app.switchboard.engine.Heretic.exportTypes.forEach { (id, label) -> DropdownMenuItem(text = { Text(label) }, onClick = { fmtMenu = false; vm.updateHeretic { it.copy(format = id) } }) }
-        }
-    }
-    FilledTonalButton(enabled = model.isNotBlank(), onClick = { scope.launch { runCatching { vm.hereticToPhone(model, h.format) } } }) { Text("Convert and download") }
-    Text("Converts heretic/out/${app.switchboard.engine.Heretic.outName(model)} to GGUF with llama.cpp on the computer, downloads it and adds it as a local model.",
-        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-    vm.hereticStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-
-    Text("4. Use it on your local models automatically", style = MaterialTheme.typography.titleSmall)
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text("Heretic for local models", style = MaterialTheme.typography.bodyMedium)
-            Text("Each local GGUF model is processed with the goal above and replaced by its Heretic version, in the same quantization (the original is kept to switch back). " +
-                "Heretic works on the original Hugging Face model, found from the GGUF's header or download link; one model at a time, each can take an hour or more on the computer.",
-                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Switch(checked = h.autoLocal, onCheckedChange = { on -> vm.updateHeretic { it.copy(autoLocal = on) } })
-    }
-    vm.settings.providers.filter { it.local != null }.forEach { p -> LocalHereticRow(vm, p) }
-    Text("Heretic by Philipp Emanuel Weidmann (AGPL-3.0), github.com/p-e-w/heretic: installed on your computer from PyPI, not bundled with Switchboard.",
-        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-}
-
-@Composable
-private fun GoalPicker(selected: String, onPick: (String) -> Unit) {
-    var menu by remember { mutableStateOf(false) }
-    val cur = app.switchboard.engine.Heretic.goal(selected)
-    Column {
-        Text("Goal", style = MaterialTheme.typography.labelMedium)
-        androidx.compose.foundation.layout.Box {
-            OutlinedButton(onClick = { menu = true }, modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier.weight(1f)) { Text(cur.label); Text(cur.description, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                Icon(Icons.Default.ExpandMore, null)
-            }
-            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                app.switchboard.engine.Heretic.goals.forEach { g ->
-                    DropdownMenuItem(text = { Column { Text(g.label); Text(g.description, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) } },
-                        onClick = { menu = false; onPick(g.id) })
-                }
-            }
         }
     }
 }
@@ -244,36 +123,6 @@ private fun ModelPicker(label: String, models: List<Studio.Model>, selected: Str
                         onClick = { menu = false; onPick(m.id) })
                 }
             }
-        }
-    }
-}
-
-/** One local model's automatic Heretic status, with what can be done about it. */
-@Composable
-private fun LocalHereticRow(vm: ChatViewModel, p: app.switchboard.data.Provider) {
-    val lm = p.local ?: return
-    val state = lm.hereticState
-    var source by remember(p.id) { mutableStateOf(lm.hereticSource) }
-    Column(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(p.name, style = MaterialTheme.typography.bodyMedium)
-        Text(when {
-            state == "done" -> "Using the Heretic version" + (lm.hereticSource.takeIf { it.isNotBlank() }?.let { " (from $it)" } ?: "")
-            state == "original" -> "Using the original file"
-            state == "needs-source" -> "Which Hugging Face model is this GGUF made from? Its header doesn't say."
-            state.startsWith("running") -> state.removePrefix("running: ").replaceFirstChar { it.uppercase() } + "…"
-            state.startsWith("failed") -> "Failed: " + state.removePrefix("failed: ")
-            !vm.settings.heretic.autoLocal -> "Not processed (turn on the switch above)"
-            else -> "Waiting its turn"
-        }, style = MaterialTheme.typography.labelSmall,
-            color = if (state.startsWith("failed") || state == "needs-source") MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
-        when {
-            state == "needs-source" || state.startsWith("failed") -> Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(source, { source = it.trim() }, label = { Text("Original model") }, placeholder = { Text("e.g. Qwen/Qwen3-4B-Instruct-2507") },
-                    singleLine = true, modifier = Modifier.weight(1f))
-                FilledTonalButton(enabled = source.isNotBlank(), onClick = { vm.hereticRequeue(p.id, source) }) { Text(if (state.startsWith("failed")) "Retry" else "Process") }
-            }
-            state == "done" -> OutlinedButton(onClick = { vm.hereticUseOriginal(p.id, true) }) { Text("Use original") }
-            state == "original" && lm.hereticPath.isNotBlank() -> OutlinedButton(onClick = { vm.hereticUseOriginal(p.id, false) }) { Text("Use Heretic version") }
         }
     }
 }

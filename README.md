@@ -95,19 +95,6 @@ Settings > **Embedded tools** lists tools built into the app. The AI can use the
   - `studio_lip_sync` turns a portrait plus audio into a talking video (OmniHuman 1.5), or re-syncs a video to new audio.
   - Switchboard uploads reference files, waits for the job and downloads the result into the chat. You choose default models, and **Ask before each generation** (on by default) confirms every paid job.
 
-- **Heretic** ([p-e-w/heretic](https://github.com/p-e-w/heretic), AGPL-3.0, installed on your computer from PyPI, not bundled). Modifies a Hugging Face model without training. By default it removes refusals; presets reduce slop, sycophancy or humor, shorten answers, or change emotional tone. It needs the **Computer** runner (Python + PyTorch, ideally an NVIDIA GPU; Linux, macOS or WSL), because it can't run on a phone.
-  - **Check computer** reports Python, PyTorch, GPU memory and whether Heretic is installed. **Install / update** installs it (and PyTorch if missing), shown live in the terminal window.
-  - **Start Heretic** fetches the chosen preset's config, sets 4-bit loading and the number of trials, and runs it in a terminal you can watch. With **Finish by itself**, it picks the best result and saves it to `heretic/out/<model>-heretic`. Without it, you choose in the terminal.
-  - **Convert and download** turns the saved model into a GGUF with llama.cpp on the computer (Q8_0, BF16 or F16), downloads it and adds it as a local model provider.
-  - The AI gets `heretic_run` and `heretic_to_phone`, and each one asks for approval first.
-  - **Heretic for local models** (switch): each local GGUF provider is processed automatically, one at a time, and switched to its Heretic version. Heretic can't read GGUF, so for each model it:
-    1. finds the original Hugging Face model, from the GGUF header (`general.base_model.0.repo_url` etc.) or a `…-GGUF` download link; if neither says, it asks you
-    2. runs Heretic on the computer with your goal
-    3. converts the result back to the same quantization as your file (`general.file_type`, e.g. Q4_K_M, via llama-quantize built once with CMake; Q8_0 if there's no CMake)
-    4. downloads it and points the provider at it
-
-    The original file is kept, with **Use original** / **Use Heretic version**. A finished run on the computer is reused if the app restarts.
-
 ## Build Android apps on the phone (no Termux)
 In **This phone** mode the model has a `build_apk` tool. It writes the app as a web app (`index.html` plus CSS, JS and assets) in the workspace, and Switchboard packages it into a real, signed APK that's attached to the chat with an **Install** button.
 - Runtime: a 3 KB WebView activity (`tools/apk-template/`, rebuild with `build.sh`) shows `assets/www/index.html` full screen. JavaScript and localStorage are on, and links to websites open in the browser.

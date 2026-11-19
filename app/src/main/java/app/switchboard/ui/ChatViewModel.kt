@@ -47,7 +47,6 @@ import app.switchboard.engine.Extras
 import app.switchboard.engine.FileTools
 import app.switchboard.engine.Toolbox
 import app.switchboard.engine.TerminalHub
-import app.switchboard.engine.Heretic
 import app.switchboard.engine.TermInfo
 import app.switchboard.data.ToolPackage
 import app.switchboard.data.InstallState
@@ -322,7 +321,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val (s, c) = withContext(Dispatchers.IO) { store.loadSettings() to store.loadConversations() }
             settings = s; conversations = c; loaded = true
-            maybeRunHereticAuto()
             Scheduler.sync(app, s)
         }
     }
@@ -693,14 +691,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // Building only writes inside Switchboard's storage; installing still goes through Android's own prompt.
         if (call.name == BUILD_APK) return buildApk(call)
         if (call.name == Extras.USE_SKILL) return Extras.useSkill(argsOf(call), settings.skills)
-        if (call.name in Heretic.toolNames) {
-            if (current.id !in alwaysAllowed) when (askApproval(call)) {
-                Approval.DENY -> return ToolResult("The user declined. Ask what to change.", isError = true)
-                Approval.ALWAYS -> alwaysAllowed += current.id
-                Approval.ONCE -> Unit
-            }
-            return hereticTool(call)
-        }
         if (call.name in Studio.toolNames) {
             if (settings.studio.confirm && current.id !in alwaysAllowed) {
                 when (askApproval(call)) {
@@ -911,12 +901,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 ". Files appear in the chat with Open/Save/Share buttons. Never say you can't make images or files: call these tools.")
         }
         if (allowAgents && toolsAllowed && settings.agents.isNotEmpty()) { tools += Extras.runAgent; sys += Extras.agentsNote(settings.agents) }
-        // Embedded Heretic: modify models on the user's computer (needs the computer runner).
-        if (toolsAllowed && settings.toolsEnabled && settings.heretic.enabled && settings.runnerMode == RunnerMode.REMOTE) {
-            tools += Heretic.tools
-            sys += "Heretic is set up on the user's computer: heretic_run modifies a Hugging Face model (e.g. removes refusals) in a terminal, " +
-                "heretic_to_phone converts the result to GGUF and adds it as a local model on this phone."
-        }
         // Embedded Open Higgsfield studio: image, video and lip sync for any model, including text-only ones.
         if (toolsAllowed && studioReady) {
             tools += Studio.tools(settings.studio.imageModel, settings.studio.videoModel)
@@ -1501,7 +1485,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             val list = if (exists) s.providers.map { if (it.id == p.id) p else it } else s.providers + p
             s.copy(providers = list, activeProviderId = s.activeProviderId ?: p.id)
         }
-        if (p.local != null) maybeRunHereticAuto() // a new local model gets processed when automatic Heretic is on
     }
 
     fun removeProvider(id: String) = updateSettings { s ->
@@ -1542,220 +1525,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     suspend fun fetchModels(p: Provider): Result<List<String>> = runCatching { client.listModels(p, settings.unrestricted) }
 
     /** Models the provider offers to this API key, with what each can produce. */
-    // --- embedded tools: Heretic (model modification on the user's computer) ---
-
-    fun updateHeretic(f: (app.switchboard.data.HereticSettings) -> app.switchboard.data.HereticSettings) { updateSettings { it.copy(heretic = f(it.heretic)) }; maybeRunHereticAuto() }
-    /** Heretic needs a computer (GPU, PyTorch); the phone and Termux can't run it. */
-    val hereticOnComputer: Boolean get() = settings.runnerMode == RunnerMode.REMOTE
-    /** Progress of a check / install / export, shown on the Embedded tools page. */
-    var hereticStatus by mutableStateOf<String?>(null); private set
-
-    private fun computerRunner(): Runner = (host() as? Runner)?.takeIf { hereticOnComputer }
-        ?: throw ApiException("Heretic runs on your computer: set Settings > Tools to Computer and start runner.py there (it needs Python, PyTorch and preferably an NVIDIA GPU).")
-
-    /** Python, PyTorch, GPU and whether Heretic is installed on the computer. */
-    suspend fun hereticCheck(): Result<String> = runCatching {
-        val r = computerRunner()
-        r.write("${Heretic.DIR}/check.py", Heretic.checkScript)
-        val out = r.exec("python3 ${Heretic.DIR}/check.py || python ${Heretic.DIR}/check.py", null, 180).str("output").orEmpty()
-        val line = out.lines().firstOrNull { it.startsWith("HERETIC_CHECK ") } ?: throw ApiException("Couldn't run Python on the computer: ${out.takeLast(300)}")
-        val o = Json.parseToJsonElement(line.removePrefix("HERETIC_CHECK ")).jsonObject
-        fun v(k: String) = (o[k] as? kotlinx.serialization.json.JsonPrimitive)?.content
-        listOfNotNull(
-            "Python ${v("python")}",
-            v("torch")?.takeIf { it != "null" }?.let { "PyTorch $it" } ?: "PyTorch not installed (Install adds it)",
-            if (v("cuda") == "true") "GPU: ${v("gpu")} (${v("vram_gb")} GB)" else if (v("mps") == "true") "Apple GPU (MPS): works, slower than NVIDIA" else "No GPU found: Heretic would be very slow on the CPU",
-            if (v("heretic") == "true") "Heretic is installed" else "Heretic isn't installed yet",
-        ).joinToString("\n")
-    }
-
-    /** Installs or updates Heretic (and PyTorch if missing) on the computer, shown live in the terminal window's Activity tab. */
-    fun hereticInstall() = viewModelScope.launch {
-        hereticStatus = "Installing Heretic on the computer… (see the terminal window)"
-        terminalSelected = TerminalHub.ACTIVITY; terminalOpen = true
-        hereticStatus = runCatching {
-            val r = computerRunner()
-            val py = "\$(command -v python3 || command -v python)"
-            val res = terms.runLive(r, "PY=$py; \$PY -c 'import torch' 2>/dev/null || \$PY -m pip install torch; \$PY -m pip install -U heretic-llm", null, 3600)
-            if (res.exitCode == 0) "Installed. Tap Check to confirm." else "Install failed (exit ${res.exitCode}): ${res.output.takeLast(300)}"
-        }.getOrElse { it.message }
-    }
-
-    /** Starts a Heretic run in a terminal on the computer; returns the terminal. */
-    suspend fun hereticStart(model: String, goalId: String, quant4bit: Boolean, trials: Int, unattended: Boolean): TermInfo {
-        computerRunner()
-        val r = terminalRunner()
-        val goal = Heretic.goal(goalId)
-        val cfg = withContext(Dispatchers.IO) {
-            val url = Heretic.CONFIG_BASE + (goal.configFile ?: "config.default.toml")
-            okhttp3.OkHttpClient().newCall(okhttp3.Request.Builder().url(url).build()).execute().use { resp ->
-                if (!resp.isSuccessful) throw ApiException("Couldn't fetch Heretic's ${goal.label} settings (HTTP ${resp.code}).")
-                resp.body!!.string()
-            }
-        }
-        r.write("${Heretic.DIR}/config.toml", Heretic.patchConfig(cfg, quant4bit, trials.coerceIn(5, 1000)))
-        r.exec("mkdir -p ${Heretic.DIR}/out", null, 30)
-        val t = terms.start(r, Heretic.runCommand(model, "config.toml", unattended), "Heretic: ${model.substringAfterLast('/')}", cwd = Heretic.DIR)
-        withContext(Dispatchers.Main) {
-            terminalSelected = t.id; terminalOpen = true
-            updateHeretic { it.copy(lastModel = model, goal = goal.id, quant4bit = quant4bit, trials = trials, unattended = unattended) }
-        }
-        return t
-    }
-
-    /** Converts the saved model to GGUF on the computer, downloads it and adds it as a local model. */
-    suspend fun hereticToPhone(model: String, format: String): String {
-        val r = computerRunner()
-        val src = if (model.startsWith("/") || model.startsWith("~") || model.startsWith("${Heretic.DIR}/")) model else "${Heretic.DIR}/out/${Heretic.outName(model)}"
-        val key = "heretic-export"
-        WorkService.hold(getApplication(), key, "Converting the Heretic model…")
-        try {
-            hereticStatus = "Converting to GGUF on the computer… (see the terminal window)"
-            r.write("${Heretic.DIR}/export.py", Heretic.exportScript)
-            val res = terms.runLive(r, "python3 ${Heretic.DIR}/export.py ${Heretic.q(src)} $format || python ${Heretic.DIR}/export.py ${Heretic.q(src)} $format", null, 3600)
-            val gguf = res.output.lines().lastOrNull { it.startsWith("GGUF_OUT ") }?.removePrefix("GGUF_OUT ")?.trim()
-                ?: throw ApiException("Conversion failed: ${res.output.lines().filter { it.isNotBlank() }.takeLast(4).joinToString(" / ")}")
-            val dest = downloadFromComputer(r, gguf) { done, total ->
-                hereticStatus = "Downloading to this phone: ${app.switchboard.local.ModelFiles.human(done)}" + if (total > 0) " of ${app.switchboard.local.ModelFiles.human(total)} (${done * 100 / total}%)" else ""
-                WorkService.hold(getApplication(), key, hereticStatus.orEmpty())
-            }
-            val name = dest.name.removeSuffix(".gguf")
-            val p = Provider(name = "$name (Heretic)", kind = app.switchboard.data.ApiKind.OPENAI_COMPATIBLE, baseUrl = app.switchboard.local.LocalEngine.baseUrl,
-                apiKey = java.util.UUID.randomUUID().toString().replace("-", ""), model = name, chatModels = listOf(name),
-                local = app.switchboard.data.LocalModel(path = dest.path, largeMode = app.switchboard.local.Fit.wantsLargeMode(dest.length(), deviceRam()),
-                    contextSize = if (app.switchboard.local.Fit.wantsLargeMode(dest.length(), deviceRam())) 4096 else 8192))
-            withContext(Dispatchers.Main) { upsertProvider(p) }
-            return "Added \"${p.name}\" as a local model (${app.switchboard.local.ModelFiles.human(dest.length())}). Pick it in the model menu.".also { hereticStatus = it }
-        } catch (e: Exception) {
-            hereticStatus = e.message; throw e
-        } finally { WorkService.release(getApplication(), key) }
-    }
-
-    // --- automatic Heretic for local GGUF models ---
-
-    private var hereticAutoJob: Job? = null
-
-    private fun updateLocal(id: String, f: (app.switchboard.data.LocalModel) -> app.switchboard.data.LocalModel) {
-        settings.providers.firstOrNull { it.id == id }?.let { p -> p.local?.let { upsertProvider(p.copy(local = f(it))) } }
-    }
-
-    /** Where the original model lives on Hugging Face: the GGUF header, else a guess from its download link. */
-    private fun hereticSourceOf(lm: app.switchboard.data.LocalModel): String? =
-        lm.hereticSource.ifBlank { null }
-            ?: runCatching { File(lm.path).inputStream().use { app.switchboard.local.GgufInfo.read(it) }.sourceRepo }.getOrNull()
-            ?: app.switchboard.local.GgufInfo.guessSourceFromLink(lm.source)
-
-    /** Local providers waiting for automatic Heretic processing. */
-    private fun hereticPending() = settings.providers.filter { p ->
-        val lm = p.local ?: return@filter false
-        lm.originalPath.isBlank() && lm.path.isNotBlank() && File(lm.path).exists() && lm.hereticState in setOf("", "queued") ||
-            lm.hereticState.startsWith("running")
-    }
-
-    /** Starts (or keeps) the background worker when automatic Heretic is on; one model at a time. */
-    fun maybeRunHereticAuto() {
-        val h = settings.heretic
-        if (!(h.enabled && h.autoLocal && hereticOnComputer)) { hereticAutoJob?.cancel(); hereticAutoJob = null; return }
-        if (hereticAutoJob?.isActive == true) return
-        hereticAutoJob = viewModelScope.launch {
-            while (true) {
-                val p = hereticPending().firstOrNull() ?: break
-                hereticProcessLocal(p.id)
-            }
-        }
-    }
-
-    /** Retry, or set the source repo for a model that needed one. */
-    fun hereticRequeue(providerId: String, source: String? = null) {
-        updateLocal(providerId) { it.copy(hereticState = "queued", hereticSource = source?.trim() ?: it.hereticSource) }
-        maybeRunHereticAuto()
-    }
-
-    /** Switch a local provider between its Heretic version and the original file. */
-    fun hereticUseOriginal(providerId: String, original: Boolean) {
-        val p = settings.providers.firstOrNull { it.id == providerId } ?: return
-        val lm = p.local ?: return
-        if (original && lm.originalPath.isNotBlank()) upsertProvider(p.copy(name = p.name.removeSuffix(" (Heretic)"),
-            local = lm.copy(path = lm.originalPath, hereticPath = lm.path, originalPath = "", hereticState = "original")))
-        if (!original && lm.hereticPath.isNotBlank() && File(lm.hereticPath).exists()) upsertProvider(p.copy(name = p.name.removeSuffix(" (Heretic)") + " (Heretic)",
-            local = lm.copy(path = lm.hereticPath, originalPath = lm.path, hereticState = "done")))
-    }
-
-    /** Runs Heretic on a local provider's source model, converts it back to the same quantization, and switches the provider to it. */
-    private suspend fun hereticProcessLocal(providerId: String) {
-        val key = "heretic-auto"
-        fun step(s: String) { updateLocal(providerId) { it.copy(hereticState = "running: $s") }; WorkService.hold(getApplication(), key, "Heretic: $s") }
-        try {
-            val p0 = settings.providers.first { it.id == providerId }
-            val lm0 = p0.local!!
-            val source = hereticSourceOf(lm0) ?: run { updateLocal(providerId) { it.copy(hereticState = "needs-source") }; return }
-            updateLocal(providerId) { it.copy(hereticSource = source) }
-            val info = runCatching { File(lm0.path).inputStream().use { app.switchboard.local.GgufInfo.read(it) } }.getOrNull()
-            val quant = info?.quantName ?: "Q8_0"
-            val r = computerRunner()
-            val out = "${Heretic.DIR}/out/${Heretic.outName(source)}"
-            // A finished run from before (e.g. the app restarted) is reused instead of starting over.
-            val saved = r.exec("test -f ${Heretic.q("$out/config.json")} && echo SAVED || echo NONE", null, 30).str("output").orEmpty().contains("SAVED")
-            if (!saved) {
-                step("processing $source on the computer (can take an hour or more)")
-                val h = settings.heretic
-                val goal = Heretic.goal(h.goal)
-                val cfg = withContext(Dispatchers.IO) {
-                    okhttp3.OkHttpClient().newCall(okhttp3.Request.Builder().url(Heretic.CONFIG_BASE + (goal.configFile ?: "config.default.toml")).build()).execute()
-                        .use { if (!it.isSuccessful) throw ApiException("Couldn't fetch Heretic's settings (HTTP ${it.code})."); it.body!!.string() }
-                }
-                r.write("${Heretic.DIR}/config.toml", Heretic.patchConfig(cfg, h.quant4bit, h.trials.coerceIn(5, 1000)))
-                r.exec("mkdir -p ${Heretic.DIR}/out", null, 30)
-                val run = terms.runLive(r, "cd ${Heretic.DIR} && " + Heretic.runCommand(source, "config.toml", unattended = true), null, 12 * 3600)
-                if (run.exitCode != 0) throw ApiException("Heretic stopped (exit ${run.exitCode}): ${run.output.lines().filter { it.isNotBlank() }.takeLast(3).joinToString(" / ")}")
-            }
-            step("converting to $quant")
-            r.write("${Heretic.DIR}/export.py", Heretic.exportScript)
-            val conv = terms.runLive(r, "python3 ${Heretic.DIR}/export.py ${Heretic.q(out)} $quant || python ${Heretic.DIR}/export.py ${Heretic.q(out)} $quant", null, 4 * 3600)
-            val gguf = conv.output.lines().lastOrNull { it.startsWith("GGUF_OUT ") }?.removePrefix("GGUF_OUT ")?.trim()
-                ?: throw ApiException("Conversion failed: ${conv.output.lines().filter { it.isNotBlank() }.takeLast(3).joinToString(" / ")}")
-            step("downloading to this phone")
-            val dest = downloadFromComputer(r, gguf) { done, total -> step("downloading to this phone: ${if (total > 0) "${done * 100 / total}%" else app.switchboard.local.ModelFiles.human(done)}") }
-            val p = settings.providers.first { it.id == providerId }
-            upsertProvider(p.copy(name = p.name.removeSuffix(" (Heretic)") + " (Heretic)",
-                local = p.local!!.copy(path = dest.path, originalPath = p.local.path, hereticPath = dest.path, hereticState = "done")))
-            app.switchboard.local.LocalEngine.stop() // the next message loads the new file
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            updateLocal(providerId) { it.copy(hereticState = "queued") }; throw e
-        } catch (e: Exception) {
-            updateLocal(providerId) { it.copy(hereticState = "failed: ${(e.message ?: e.javaClass.simpleName).take(300)}") }
-        } finally { WorkService.release(getApplication(), key) }
-    }
-
-    /** Streams a file from the computer into the models folder (checked to be a GGUF). */
-    private suspend fun downloadFromComputer(r: Runner, remote: String, onProgress: (Long, Long) -> Unit): File {
-        val dest = File(modelsDir(), remote.substringAfterLast('/').substringAfterLast('\\'))
-        val part = File(dest.path + ".part")
-        r.download(remote, part, onProgress)
-        app.switchboard.local.ModelFiles.checkGguf(part)
-        dest.delete(); part.renameTo(dest)
-        return dest
-    }
-
-    private suspend fun hereticTool(call: ToolCall): ToolResult {
-        val a = argsOf(call)
-        val model = a.str("model")?.takeIf { it.isNotBlank() } ?: return ToolResult("Missing 'model'.", true)
-        return runCatching {
-            when (call.name) {
-                Heretic.RUN_TOOL -> {
-                    val h = settings.heretic
-                    val t = hereticStart(model, a.str("goal") ?: h.goal, a.str("quantize_4bit")?.toBooleanStrictOrNull() ?: h.quant4bit,
-                        a.str("trials")?.toIntOrNull() ?: h.trials, unattended = true)
-                    terms.awaitOutput(t.id, 4000)
-                    "Started Heretic in terminal ${t.id} (in the user's terminal window). It benchmarks the GPU, runs the trials, then saves to " +
-                        "${Heretic.DIR}/out/${Heretic.outName(model)} on the computer. This takes a while; check with terminal_read (wait_ms up to 20000), " +
-                        "then call heretic_to_phone.\n" + terms.modelView(t.id)
-                }
-                else -> hereticToPhone(model, a.str("format")?.lowercase()?.takeIf { f -> Heretic.exportTypes.any { it.first == f } } ?: settings.heretic.format)
-            }
-        }.fold({ ToolResult(it) }, { ToolResult(it.message ?: it.javaClass.simpleName, true) })
-    }
-
     // --- embedded tools: Open Higgsfield studio (kie.ai) ---
 
     private val STUDIO_KEY = "embedded:studio"

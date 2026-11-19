@@ -45,21 +45,6 @@ data class StudioSettings(
     val confirm: Boolean = true,
 )
 
-/** Heretic (model modification) on the user's computer, embedded. */
-@Serializable
-data class HereticSettings(
-    val enabled: Boolean = false,
-    val goal: String = "decensor",
-    val quant4bit: Boolean = false,
-    val trials: Int = 100,
-    /** Pick the best result and save it without asking (otherwise Heretic asks in the terminal). */
-    val unattended: Boolean = true,
-    val lastModel: String = "",
-    val format: String = "q8_0",
-    /** Process every local GGUF model with Heretic automatically (on the computer) and use the result instead. */
-    val autoLocal: Boolean = false,
-)
-
 /** A GGUF model file on the phone, run by the built-in llama.cpp engine. */
 @Serializable
 data class LocalModel(
@@ -77,16 +62,6 @@ data class LocalModel(
      * compressed conversation cache and smaller work buffers, so models larger than RAM (especially MoE) can run.
      */
     val largeMode: Boolean = false,
-    /**
-     * Automatic Heretic processing: "" (not yet), "queued", "running: <step>", "done", "needs-source", "failed: <why>",
-     * "original" (the user switched back; not processed again).
-     */
-    val hereticState: String = "",
-    /** Hugging Face repo of the original model Heretic processes (from the GGUF header, a guess, or the user). */
-    val hereticSource: String = "",
-    /** The untouched GGUF and the Heretic version, to switch between them. */
-    val originalPath: String = "",
-    val hereticPath: String = "",
 )
 
 /** How a toolbox entry is installed. AUTO decides from the source address. */
@@ -316,7 +291,6 @@ data class AppSettings(
     val packages: List<ToolPackage> = emptyList(),
     /** Embedded tools (built into the app); the API key is kept encrypted in the token store, not here. */
     val studio: StudioSettings = StudioSettings(),
-    val heretic: HereticSettings = HereticSettings(),
     /** Offer generate_image, create_document and text_to_speech to the model. */
     val fileTools: Boolean = true,
     /** Send messages that clearly ask for a picture straight to the image model (doesn't rely on the chat model using tools). */

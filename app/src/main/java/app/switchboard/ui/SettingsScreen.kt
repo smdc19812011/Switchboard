@@ -107,7 +107,7 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpen: (String) -> Un
                 Triple(Pages.AGENTS, "Agents", "Assistants with their own prompt and model · ${st.agents.size}"),
                 Triple(Pages.PROJECTS, "Projects", "Chats with shared instructions and files · ${st.projects.size}"),
                 Triple(Pages.TASKS, "Scheduled tasks", "Prompts that run on their own · ${st.tasks.size}"),
-                Triple(Pages.EMBEDDED, "Embedded tools", "Built-in tools the AI can use · Open Higgsfield ${if (st.studio.enabled) "on" else "off"} · Heretic ${if (st.heretic.enabled) "on" else "off"}"),
+                Triple(Pages.EMBEDDED, "Embedded tools", "Built-in tools the AI can use · Open Higgsfield ${if (st.studio.enabled) "on" else "off"}"),
                 Triple(Pages.TOOLBOX, "Toolbox", "Tools installed once and reused · ${st.packages.count { it.installs[st.runnerMode.name]?.ok == true }}/${st.packages.size}"),
             ).forEach { (page, title, sub) ->
                 ListItem(headlineContent = { Text(title) }, supportingContent = { Text(sub) },
@@ -126,7 +126,6 @@ fun SettingsScreen(vm: ChatViewModel, onBack: () -> Unit, onOpen: (String) -> Un
                         val transfers by app.switchboard.local.ModelDownloads.all.collectAsState()
                         val t = p.local?.let { transfers[it.path] }?.takeIf { it.active || it.error != null }
                         Text(p.local?.let { lm -> "On this phone · ${java.io.File(lm.path).name.ifBlank { "no model file yet" }}" +
-                            (if (lm.hereticState.startsWith("running")) " · Heretic: working" else "") +
                             (t?.let { if (it.error != null) " · download failed (edit to retry)" else " · downloading" + (if (it.percent >= 0) " ${it.percent}%" else "…") } ?: "") }
                             ?: "${p.model.ifBlank { "no model" }} · ${p.baseUrl}", maxLines = 2)
                     },

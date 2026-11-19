@@ -13,8 +13,8 @@ android {
         applicationId = "app.switchboard"
         minSdk = 26
         targetSdk = 35
-        versionCode = 44
-        versionName = "1.44"
+        versionCode = 45
+        versionName = "1.45"
     }
 
     buildTypes {
