@@ -45,6 +45,19 @@ data class StudioSettings(
     val confirm: Boolean = true,
 )
 
+/** Heretic (model modification) on the user's computer, embedded. */
+@Serializable
+data class HereticSettings(
+    val enabled: Boolean = false,
+    val goal: String = "decensor",
+    val quant4bit: Boolean = false,
+    val trials: Int = 100,
+    /** Pick the best result and save it without asking (otherwise Heretic asks in the terminal). */
+    val unattended: Boolean = true,
+    val lastModel: String = "",
+    val format: String = "q8_0",
+)
+
 /** A GGUF model file on the phone, run by the built-in llama.cpp engine. */
 @Serializable
 data class LocalModel(
@@ -291,6 +304,7 @@ data class AppSettings(
     val packages: List<ToolPackage> = emptyList(),
     /** Embedded tools (built into the app); the API key is kept encrypted in the token store, not here. */
     val studio: StudioSettings = StudioSettings(),
+    val heretic: HereticSettings = HereticSettings(),
     /** Offer generate_image, create_document and text_to_speech to the model. */
     val fileTools: Boolean = true,
     /** Send messages that clearly ask for a picture straight to the image model (doesn't rely on the chat model using tools). */

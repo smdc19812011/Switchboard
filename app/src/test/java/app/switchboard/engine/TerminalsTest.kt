@@ -57,7 +57,7 @@ class TerminalsTest {
         val hub = TerminalHub(scope) {}
         try {
             val runner = Runner("http://127.0.0.1:$port", "t", unrestricted = false)
-            assertEquals(3, runner.version())
+            assertEquals(4, runner.version())
             val r = hub.runLive(runner, "echo one; sleep 1; echo two >&2; exit 4", null, 30)
             assertEquals(4, r.exitCode); assertFalse(r.timedOut); assertEquals("one\ntwo", r.output.trim())
             val shown = String(hub.snapshot(TerminalHub.ACTIVITY).first)

@@ -82,7 +82,7 @@ def run(command, cwd, timeout):
 def info():
     return {
         "runner": "switchboard",
-        "version": 3,
+        "version": 4,
         "terminals": os.name != "nt",
         "jobs": True,
         "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
@@ -234,8 +234,14 @@ class Handler(BaseHTTPRequestHandler):
             path = resolve(parse_qs(url.query).get("path", [""])[0])
             if not os.path.isfile(path):
                 return self._send(404, {"error": f"no such file: {path}"})
+            # Streamed in chunks, so multi-gigabyte files (models) don't have to fit in memory.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(os.path.getsize(path)))
+            self.end_headers()
             with open(path, "rb") as f:
-                return self._send(200, raw=f.read(), ctype="application/octet-stream")
+                shutil.copyfileobj(f, self.wfile, 1024 * 1024)
+            return
         self._send(404, {"error": "unknown endpoint"})
 
     def do_POST(self):

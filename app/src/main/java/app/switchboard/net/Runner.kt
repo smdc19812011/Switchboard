@@ -87,13 +87,22 @@ class Runner(private val baseUrl: String, private val token: String, private val
     }
 
     /** Streams a file from the runner into [dest]. */
-    suspend fun download(path: String, dest: File) = run {
+    suspend fun download(path: String, dest: File, onProgress: ((Long, Long) -> Unit)? = null) = run {
         val url = url("/download").newBuilder().addQueryParameter("path", path).build()
         val client = http.newBuilder().readTimeout(5, TimeUnit.MINUTES).build()
         client.newCall(Request.Builder().url(url).header("Authorization", "Bearer $token").build()).cancellable { r ->
             if (!r.isSuccessful) throw ApiException(errorOf(r.code, r.body?.string().orEmpty()))
             dest.parentFile?.mkdirs()
-            dest.outputStream().use { out -> r.body!!.byteStream().copyTo(out) }
+            val total = r.body!!.contentLength()
+            dest.outputStream().use { out ->
+                val inp = r.body!!.byteStream(); val buf = ByteArray(1 shl 20); var done = 0L; var last = 0L
+                while (true) {
+                    val n = inp.read(buf); if (n < 0) break
+                    out.write(buf, 0, n); done += n
+                    if (onProgress != null && System.currentTimeMillis() - last > 300) { last = System.currentTimeMillis(); onProgress(done, total) }
+                }
+                onProgress?.invoke(done, total)
+            }
         }
     }
 
