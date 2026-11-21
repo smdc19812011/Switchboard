@@ -32,7 +32,55 @@ object LocalEngine {
     @Volatile var launcher: EngineLauncher = InProcessLauncher
     const val PORT = 8737
 
-    private data class Key(val path: String, val ctx: Int, val threads: Int, val apiKey: String, val large: Boolean = false)
+    /** [gpu]: device name to offload to (null = CPU only), [gpuLayers] -1 = as many as fit. */
+    private data class Key(val path: String, val ctx: Int, val threads: Int, val apiKey: String, val large: Boolean = false,
+                           val gpu: String? = null, val gpuLayers: Int = -1)
+
+    /** A GPU the engine can use, as `--list-devices` reports it (e.g. GPUOpenCL: QUALCOMM Adreno(TM) 650). */
+    data class GpuDevice(val name: String, val description: String, val totalMiB: Long, val freeMiB: Long) {
+        val api get() = when { name.startsWith("Vulkan") -> "Vulkan"; name.contains("OpenCL") -> "OpenCL"; else -> name }
+    }
+
+    /** Extra environment for the engine (tests use it to expose a software GPU). */
+    @Volatile var extraEnv: Map<String, String> = emptyMap()
+    @Volatile private var deviceCache: Pair<String, List<GpuDevice>>? = null
+
+    /** Library folders for the engine: its own, then the phone's GPU drivers (the OpenCL driver lives in /vendor). */
+    private fun engineEnv(bin: File) = mapOf("LD_LIBRARY_PATH" to listOfNotNull(bin.parentFile?.path, "/vendor/lib64", "/system/vendor/lib64", "/odm/lib64").joinToString(":")) + extraEnv
+
+    /** Parses `--list-devices` output. */
+    fun parseDevices(out: String): List<GpuDevice> = out.lines().mapNotNull { l ->
+        val m = Regex("^\\s+([^:\\s]+): (.*) \\((\\d+) MiB, (\\d+) MiB free\\)\\s*$").find(l) ?: return@mapNotNull null
+        GpuDevice(m.groupValues[1], m.groupValues[2], m.groupValues[3].toLong(), m.groupValues[4].toLong())
+    }
+
+    /** The GPUs this phone exposes to the engine (asked once, then remembered). */
+    suspend fun devices(): List<GpuDevice> = withContext(Dispatchers.IO) {
+        val bin = binary ?: return@withContext emptyList()
+        deviceCache?.takeIf { it.first == bin.path }?.let { return@withContext it.second }
+        runCatching {
+            val pb = ProcessBuilder(bin.path, "--list-devices").redirectErrorStream(true)
+            pb.environment().putAll(engineEnv(bin))
+            val p = pb.start()
+            val out = p.inputStream.bufferedReader().readText()
+            if (!p.waitFor(30, TimeUnit.SECONDS)) p.destroyForcibly()
+            parseDevices(out)
+        }.getOrDefault(emptyList()).also { deviceCache = bin.path to it }
+    }
+
+    /** The one GPU to use (the same GPU often appears through both OpenCL and Vulkan; using both would split it in two). */
+    fun pickDevice(devices: List<GpuDevice>, backend: String): GpuDevice? = when (backend) {
+        "opencl" -> devices.firstOrNull { it.api == "OpenCL" }
+        "vulkan" -> devices.firstOrNull { it.api == "Vulkan" }
+        else -> devices.firstOrNull { it.api == "OpenCL" } ?: devices.firstOrNull { it.api == "Vulkan" }
+    }
+
+    /** Engine arguments for the processor choice: one GPU plus the CPU, or CPU only. */
+    fun gpuArgs(device: String?, layers: Int): List<String> =
+        if (device == null) listOf("-dev", "none") else listOf("-dev", device, "-ngl", if (layers < 0) "auto" else "$layers")
+
+    /** Set when the GPU failed for the loaded model and it fell back to the CPU, for the status line. */
+    @Volatile var gpuNote: String? = null; private set
 
     private val mutex = Mutex()
     private var proc: EngineHandle? = null
@@ -60,6 +108,8 @@ object LocalEngine {
         val promptDone: Int = 0, val promptTotal: Int = 0, val tokens: Int = 0, val tokensPerSec: Double = 0.0,
         /** Compute threads the engine uses, how many are running right now, and the phone's CPU cores. */
         val threads: Int = 0, val busyThreads: Int = 0, val cores: Int = Runtime.getRuntime().availableProcessors(),
+        /** The GPU in use and how many layers are on it ("28/36"); null when running on the CPU only. */
+        val gpu: String? = null, val gpuLayers: String? = null, val gpuNote: String? = null,
     ) {
         val memoryFraction get() = if (modelBytes > 0) (residentBytes.toDouble() / modelBytes).coerceIn(0.0, 1.0) else 0.0
         val promptFraction get() = if (promptTotal > 0) (promptDone.toDouble() / promptTotal).coerceIn(0.0, 1.0) else 0.0
@@ -160,7 +210,8 @@ object LocalEngine {
         if (lm.path.isBlank()) throw ApiException("${p.name}: no model file yet. Edit the provider to download a .gguf or choose one on the phone.")
         if (File(lm.path + ".part").exists() && !file.exists()) throw ApiException("${p.name}: the model is still downloading.")
         if (!file.canRead()) throw ApiException("${p.name}: can't read ${lm.path}. Choose the file again (or allow All files access).")
-        val key = Key(file.path, lm.contextSize.coerceIn(512, 262_144), lm.threads, p.apiKey, lm.largeMode)
+        val device = if (lm.processor == "cpu") null else pickDevice(devices(), lm.gpuBackend)?.name
+        val key = Key(file.path, lm.contextSize.coerceIn(512, 262_144), lm.threads, p.apiKey, lm.largeMode, device, lm.gpuLayers)
         keepMs = lm.keepMinutes.coerceAtLeast(1) * 60_000L
         touch()
         // All engine work (health checks, waiting for an old engine to exit, starting) stays off the main thread.
@@ -168,16 +219,26 @@ object LocalEngine {
             if (running == key && proc?.isAlive == true && healthy(key.apiKey)) return@withLock
             stopLocked()
             val name = p.model.ifBlank { file.name }
-            try { start(bin, key, name, quantCache = key.large) }
-            catch (e: ApiException) {
-                val log = recentLog(40).lowercase()
-                when {
-                    // Some models can't use the 8-bit conversation cache (head size not a multiple of 32): use the normal one.
-                    key.large && "cache type" in log -> start(bin, key, name, quantCache = false)
-                    // The previous engine hadn't released the port yet.
-                    "bind" in log || "address already in use" in log -> { delay(1500); start(bin, key, name, quantCache = key.large) }
-                    else -> throw e
+            gpuNote = null
+            suspend fun attempt(k: Key) {
+                try { start(bin, k, name, quantCache = k.large) }
+                catch (e: ApiException) {
+                    val log = recentLog(40).lowercase()
+                    when {
+                        // Some models can't use the 8-bit conversation cache (head size not a multiple of 32): use the normal one.
+                        k.large && "cache type" in log -> start(bin, k, name, quantCache = false)
+                        // The previous engine hadn't released the port yet.
+                        "bind" in log || "address already in use" in log -> { delay(1500); start(bin, k, name, quantCache = k.large) }
+                        else -> throw e
+                    }
                 }
+            }
+            try { attempt(key) }
+            catch (e: ApiException) {
+                // A GPU driver that can't run this model (unsupported operation, out of GPU memory, crash): run it on the CPU instead.
+                if (key.gpu == null || "Android stopped the engine" in (e.message ?: "")) throw e
+                gpuNote = "The GPU couldn't run this model, so it's running on the CPU. (${e.message?.lines()?.firstOrNull()?.take(120)})"
+                attempt(key.copy(gpu = null))
             }
         } }
         touch()
@@ -191,7 +252,9 @@ object LocalEngine {
             "--jinja", "--api-key", key.apiKey, "--no-webui", "-a", name)
         if (key.threads > 0) args += listOf("-t", "${key.threads}")
         args += largeModeArgs(key.large, quantCache)
-        val env = bin.parentFile?.let { mapOf("LD_LIBRARY_PATH" to it.path) }.orEmpty()
+        args += gpuArgs(key.gpu, key.gpuLayers)
+        args += listOf("-lv", "4") // loading details: which device, how many layers on it
+        val env = engineEnv(bin)
         val p = try { launcher.start(args, env) } catch (e: Exception) { _status.value = null; _progress.value = null; throw ApiException("Couldn't start the local model engine: ${e.message}") }
         proc = p; running = key
         val pid = p.pid.takeIf { it > 0 } ?: findEnginePid(bin.path, PORT)
@@ -211,7 +274,8 @@ object LocalEngine {
             delay(300)
         }
         _status.value = name
-        _progress.value = _progress.value?.copy(phase = Phase.IDLE)
+        val (gpuName, offloaded) = placementFromLog(p.log(200))
+        _progress.value = _progress.value?.copy(phase = Phase.IDLE, gpu = if (key.gpu == null) null else gpuName, gpuLayers = if (key.gpu == null) null else offloaded, gpuNote = gpuNote)
         startIdleWatch()
     }
 
@@ -228,6 +292,16 @@ object LocalEngine {
         val m = MemoryStatus.read()
         val free = m?.let { " (${ModelFiles.human(it.freeRam)} of ${ModelFiles.human(it.totalRam)} free now)" } ?: ""
         return (if (isSamsung) "; on this phone, also set RAM Plus to its largest size (Settings > Battery and device care > Memory > RAM Plus) so Android can park other apps on storage" else "") + "$free."
+    }
+
+    /** From the engine's loading log: the GPU it used ("Adreno (TM) 650 (OpenCL)") and the layers on it ("28/36"). */
+    fun placementFromLog(log: String): Pair<String?, String?> {
+        val dev = Regex("using device (\\S+) \\((.+?)\\)(?: \\(| -)").find(log)?.let { m ->
+            val api = GpuDevice(m.groupValues[1], "", 0, 0).api
+            "${m.groupValues[2]} ($api)"
+        }
+        val layers = Regex("offloaded (\\d+)/(\\d+) layers to GPU").findAll(log).lastOrNull()?.let { "${it.groupValues[1]}/${it.groupValues[2]}" }
+        return dev to layers
     }
 
     private fun explain(log: String, exit: Int = 0): String {

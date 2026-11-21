@@ -35,7 +35,16 @@ fun localStatusLines(pr: LocalEngine.Progress): Pair<String, String?> {
     // While it reads or writes, how many of its threads are actually running (fewer than set = waiting on storage or memory).
     val threads = if (pr.threads > 0) "Threads: ${pr.threads} of ${pr.cores} cores" +
         (if (pr.phase == LocalEngine.Phase.READING || pr.phase == LocalEngine.Phase.WRITING) " · ${pr.busyThreads} busy now" else "") else null
-    val detail = listOfNotNull(memory, threads).joinToString("\n").ifEmpty { null }
+    // Where the model runs: the GPU and its share of the layers (the rest on the CPU), or the CPU alone.
+    val processor = when {
+        pr.gpu != null -> "GPU: ${pr.gpu}" + (pr.gpuLayers?.let { l ->
+            val (on, all) = l.split('/').map { it.toIntOrNull() ?: 0 }.let { it[0] to it.getOrElse(1) { 0 } }
+            if (on >= all && all > 0) " · all $all layers on the GPU" else " · $on of $all layers on the GPU, the rest on the CPU"
+        } ?: "")
+        pr.phase != LocalEngine.Phase.LOADING && pr.threads > 0 -> "Running on the CPU" + (pr.gpuNote?.let { " · $it" } ?: "")
+        else -> null
+    }
+    val detail = listOfNotNull(memory, processor, threads).joinToString("\n").ifEmpty { null }
     return title to detail
 }
 

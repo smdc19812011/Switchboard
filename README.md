@@ -83,6 +83,12 @@ Settings > Add provider > **Local model (GGUF on this phone)** runs a model on t
   - writing (tokens per second)
 
   A thin second bar shows how much of the model is in memory right now, read from `/proc`. That's the useful number for MoE and bigger-than-memory models, which read weights from storage as they go. "Load now to test" shows the same bar.
+- **GPU + CPU** (the default for each local model): the model is split between the phone's GPU and CPU. As many layers as fit in GPU memory go on the GPU (llama.cpp's automatic fit) and the rest run on the CPU.
+  - **Adreno** (Snapdragon) GPUs use Qualcomm's OpenCL backend, with the phone's own driver. **Mali, Exynos and Tensor** GPUs use Vulkan.
+  - When a GPU appears through both OpenCL and Vulkan, only one is used.
+  - You can set a fixed number of GPU layers, pick OpenCL or Vulkan, or choose **CPU only**.
+  - If the GPU can't run a model, it restarts on the CPU by itself and says why. The status bar shows the GPU in use and how many layers are on it.
+- The CPU part uses the fastest build the phone's processor supports, from ARMv8.0 to ARMv9.2.
 - It needs a 64-bit ARM phone. Small models (1–4B parameters, Q4_K_M) are the practical size, and a model needs a bit more free memory than its file size. The engine is rebuilt with `tools/build-llama-server.sh`.
 
 ## Embedded tools

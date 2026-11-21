@@ -28,6 +28,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -53,6 +54,7 @@ import java.io.File
  * Add or edit a model that runs on the phone: get a .gguf by link (Hugging Face links work) or pick one already on the
  * phone, then set context size and threads. The built-in llama.cpp engine serves it to chats like any other provider.
  */
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDismiss: () -> Unit, onSave: (Provider) -> Unit) {
     val lm0 = initial.local ?: LocalModel()
@@ -65,6 +67,11 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
     var threads by rememberSaveable { mutableStateOf(if (lm0.threads > 0) lm0.threads.toString() else "") }
     var keep by rememberSaveable { mutableStateOf(lm0.keepMinutes.toString()) }
     var large by rememberSaveable { mutableStateOf(lm0.largeMode) }
+    var processor by rememberSaveable { mutableStateOf(lm0.processor) }
+    var gpuLayers by rememberSaveable { mutableStateOf(if (lm0.gpuLayers >= 0) lm0.gpuLayers.toString() else "") }
+    var gpuBackend by rememberSaveable { mutableStateOf(lm0.gpuBackend) }
+    var devices by remember { mutableStateOf<List<LocalEngine.GpuDevice>?>(null) }
+    LaunchedEffect(Unit) { devices = LocalEngine.devices() }
     var info by remember { mutableStateOf<app.switchboard.local.GgufInfo?>(null) }
     var picked by remember { mutableStateOf<ChatViewModel.PickedFile?>(null) }
     var testNote by remember { mutableStateOf<String?>(null) }
@@ -113,7 +120,8 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
             apiKey = localKey,
             model = model, chatModels = listOf(model), imageModels = emptyList(), audioModels = emptyList(), videoModels = emptyList(),
             local = LocalModel(path = path, source = source, contextSize = ctx.toIntOrNull()?.coerceIn(512, 262_144) ?: 8192,
-                threads = threads.toIntOrNull()?.coerceIn(0, 32) ?: 0, keepMinutes = keep.toIntOrNull()?.coerceIn(1, 1440) ?: 10, largeMode = large))
+                threads = threads.toIntOrNull()?.coerceIn(0, 32) ?: 0, keepMinutes = keep.toIntOrNull()?.coerceIn(1, 1440) ?: 10, largeMode = large,
+                processor = processor, gpuLayers = gpuLayers.toIntOrNull()?.coerceIn(0, 999) ?: -1, gpuBackend = gpuBackend))
     }
 
     /** Saves the provider as soon as a download or copy starts, so it isn't lost if the dialog closes before it finishes. */
@@ -205,6 +213,38 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
                 OutlinedTextField(keep, { keep = it.filter(Char::isDigit).take(4) }, label = { Text("Unload after") }, singleLine = true,
                     supportingText = { Text("idle min") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
+            }
+            // Processor: GPU + CPU (split automatically) or CPU only.
+            Text("Processor", style = MaterialTheme.typography.labelMedium)
+            androidx.compose.material3.SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                listOf("auto" to "GPU + CPU", "cpu" to "CPU only").forEachIndexed { i, (id, label) ->
+                    SegmentedButton(selected = processor == id, onClick = { processor = id },
+                        shape = androidx.compose.material3.SegmentedButtonDefaults.itemShape(i, 2)) { Text(label) }
+                }
+            }
+            val devs = devices
+            val chosen = devs?.let { LocalEngine.pickDevice(it, gpuBackend) }
+            Text(when {
+                devs == null -> "Looking for a GPU…"
+                devs.isEmpty() -> "No usable GPU found on this phone, so it runs on the CPU."
+                processor == "cpu" -> "GPU available (${devs.joinToString { "${it.description} via ${it.api}" }}) but not used."
+                else -> "Uses ${chosen?.description ?: "the GPU"} via ${chosen?.api ?: "?"} for as many layers as fit in its memory, and the CPU for the rest. If the GPU can't run a model, it switches to the CPU by itself."
+            }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (processor != "cpu" && !devs.isNullOrEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(gpuLayers, { gpuLayers = it.filter(Char::isDigit).take(3) }, label = { Text("GPU layers") }, placeholder = { Text("Auto") },
+                    singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f),
+                    supportingText = { Text("blank = as many as fit") })
+                if (devs.map { it.api }.distinct().size > 1) {
+                    var menu by remember { mutableStateOf(false) }
+                    androidx.compose.foundation.layout.Box(Modifier.weight(1f)) {
+                        OutlinedButton(onClick = { menu = true }) { Text(when (gpuBackend) { "opencl" -> "OpenCL"; "vulkan" -> "Vulkan"; else -> "Auto" }) }
+                        androidx.compose.material3.DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                            listOf("auto" to "Auto (OpenCL on Adreno)", "opencl" to "OpenCL", "vulkan" to "Vulkan").forEach { (id, label) ->
+                                androidx.compose.material3.DropdownMenuItem(text = { Text(label) }, onClick = { menu = false; gpuBackend = id })
+                            }
+                        }
+                    }
+                }
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {

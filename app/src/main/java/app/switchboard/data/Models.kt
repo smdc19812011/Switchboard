@@ -62,6 +62,12 @@ data class LocalModel(
      * compressed conversation cache and smaller work buffers, so models larger than RAM (especially MoE) can run.
      */
     val largeMode: Boolean = false,
+    /** "auto": GPU + CPU (as many layers on the GPU as fit, the rest on the CPU); "cpu": CPU only. */
+    val processor: String = "auto",
+    /** Layers on the GPU: -1 = as many as fit, otherwise that many. */
+    val gpuLayers: Int = -1,
+    /** Which GPU interface: "auto" (OpenCL on Adreno, else Vulkan), "opencl" or "vulkan". */
+    val gpuBackend: String = "auto",
 )
 
 /** How a toolbox entry is installed. AUTO decides from the source address. */
