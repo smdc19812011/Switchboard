@@ -49,7 +49,9 @@ object LocalEngine {
 
     /** Library folders for the engine: its own, then the phone's GPU drivers (the OpenCL driver lives in /vendor). */
     private fun engineEnv(bin: File) = mapOf(
-        "LD_LIBRARY_PATH" to listOfNotNull(bin.parentFile?.path, "/vendor/lib64", "/system/vendor/lib64", "/odm/lib64").joinToString(":"),
+        // The engine's own libraries, then Android's (libvulkan.so, liblog.so live in /system/lib64: a program started by an app
+        // only searches the folders listed here), then the GPU/NPU drivers in /vendor.
+        "LD_LIBRARY_PATH" to listOfNotNull(bin.parentFile?.path, "/system/lib64", "/vendor/lib64", "/system/vendor/lib64", "/odm/lib64").joinToString(":"),
         // Where the Snapdragon NPU loader finds the NPU-side programs (libggml-htp-v73…v85.so, shipped next to the engine).
         "ADSP_LIBRARY_PATH" to listOfNotNull(bin.parentFile?.path, "/vendor/lib/rfsa/adsp", "/vendor/lib/rfsa/cdsp", "/vendor/dsp/cdsp", "/vendor/dsp", "/system/lib/rfsa/adsp").joinToString(";"),
     ) + extraEnv
@@ -73,7 +75,25 @@ object LocalEngine {
             val exited = p.waitFor(60, TimeUnit.SECONDS)
             if (!exited) p.destroyForcibly()
             lastProbe = "exit ${if (exited) p.exitValue() else "timeout"}\n" + out.trim().takeLast(6000)
-            parseDevices(out)
+            val devs = parseDevices(out)
+            // Release builds load GPU/NPU parts silently: when one is missing, load it explicitly once to get the reason.
+            if (devs.none { !it.isNpu } || devs.none { it.isNpu }) {
+                val dir = bin.parentFile
+                val missing = listOf("vulkan" to "Vulkan", "opencl" to "OpenCL", "hexagon" to "Hexagon")
+                    .filter { (_, api) -> devs.none { d -> d.api == api } }
+                    .mapNotNull { (n, api) -> File(dir, "libggml-$n.so").takeIf { it.exists() }?.let { it to api } }
+                for ((lib, api) in missing) {
+                    val dp = ProcessBuilder(bin.path, "-lv", "4", "--list-devices").redirectErrorStream(true)
+                    dp.environment().putAll(engineEnv(bin) + ("GGML_BACKEND_PATH" to lib.path))
+                    val d = dp.start()
+                    val dout = d.inputStream.bufferedReader().readText()
+                    if (!d.waitFor(60, TimeUnit.SECONDS)) d.destroyForcibly()
+                    val why = dout.lines().filter { Regex("(?i)load_backend|failed|error|not found|cannot|ggml_vulkan|ggml_opencl|ggml-hex").containsMatchIn(it) }
+                        .map { it.replace(Regex("^[0-9.]+ [A-Z] "), "") }.distinct().take(4)
+                    lastProbe += "\n[$api] " + (why.joinToString("\n  ").ifBlank { "no message" })
+                }
+            }
+            devs
         }.getOrElse { lastProbe = "couldn't run the check: ${it.message}"; emptyList() }
         // Only a successful answer is remembered: an empty one is asked again next time.
         if (found.isNotEmpty()) deviceCache = bin.path to found
