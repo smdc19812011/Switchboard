@@ -112,6 +112,18 @@ class LocalGpuTest {
             ChatClient().stream(cpu, listOf(ChatMessage(role = Role.USER, text = "Hi")), RequestOptions(maxTokens = 4)).toList()
             assertNull(LocalEngine.progress.value!!.gpu)
 
+            // A GPU the engine can't use (as on the phone, where NPU + GPU failed): it falls back to the CPU and the status says
+            // why, instead of "no GPU or NPU was detected". The failed combination isn't retried on the next message.
+            LocalEngine.stop()
+            LocalEngine.deviceOverride = listOf(LocalEngine.GpuDevice("HTP0", "Hexagon", 0, 0), LocalEngine.GpuDevice("Vulkan7", "Broken GPU", 100, 100))
+            val broken = p.copy(local = p.local!!.copy(path = model.path, contextSize = 1024))
+            ChatClient().stream(broken, listOf(ChatMessage(role = Role.USER, text = "Hi")), RequestOptions(maxTokens = 4)).toList()
+            val fb = LocalEngine.progress.value!!
+            assertNull(fb.gpu)
+            assertTrue("${fb.gpuNote}", fb.gpuNote!!.startsWith("The GPU/NPU couldn't run this model, so it's running on the CPU: ") && "no GPU or NPU was detected" !in fb.gpuNote!!)
+            assertTrue(LocalEngine.gpuFailures, LocalEngine.gpuFailures.contains("[HTP0,Vulkan7 failed]") && LocalEngine.gpuFailures.contains("[Vulkan7 failed]"))
+            LocalEngine.deviceOverride = null
+
             // Asking for OpenCL where there is none: no GPU device, so it runs on the CPU rather than failing.
             val ocl = p.copy(local = p.local!!.copy(gpuBackend = "opencl"))
             ChatClient().stream(ocl, listOf(ChatMessage(role = Role.USER, text = "Hi")), RequestOptions(maxTokens = 4)).toList()

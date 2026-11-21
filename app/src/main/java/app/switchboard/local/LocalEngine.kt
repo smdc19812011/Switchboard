@@ -63,7 +63,11 @@ object LocalEngine {
     }
 
     /** The GPUs this phone exposes to the engine (asked once, then remembered). */
+    /** Tests only: pretend these devices were found. */
+    @Volatile var deviceOverride: List<GpuDevice>? = null
+
     suspend fun devices(force: Boolean = false): List<GpuDevice> = withContext(Dispatchers.IO) {
+        deviceOverride?.let { return@withContext it }
         val bin = binary ?: return@withContext emptyList()
         if (!force) deviceCache?.takeIf { it.first == bin.path }?.let { return@withContext it.second }
         val found = runCatching {
@@ -101,6 +105,20 @@ object LocalEngine {
     }
 
     @Volatile private var cpuOnlyByChoice: Boolean? = null
+    /** GPU/NPU combinations ("file|devices") that failed to load a model this session: not tried again. */
+    private val failedCombos = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    /** The loading logs of GPU/NPU attempts that failed (shown under Check GPU/NPU). */
+    @Volatile var gpuFailures: String = ""
+        private set
+
+    /** The engine's own error lines from a failed load (its log level "E", or words like failed/unsupported/out of memory). */
+    fun failureReason(e: ApiException): String {
+        val lines = (e.message.orEmpty() + "\n" + recentLog(60)).lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val pick = lines.firstOrNull { Regex("^[0-9.]+ E ").containsMatchIn(it) }
+            ?: lines.firstOrNull { Regex("(?i)out of memory|failed to allocate|unsupported|not supported|abort|error|failed").containsMatchIn(it) && !it.startsWith("The local model stopped") }
+            ?: lines.first()
+        return pick.replace(Regex("^[0-9.]+ [A-Z] "), "").take(180)
+    }
 
     /** The most telling line from the last GPU/NPU check when it found nothing (e.g. which driver library failed to load). */
     fun probeProblem(): String? = lastProbe.lines().map { it.trim() }.filter { it.isNotEmpty() }
@@ -305,20 +323,29 @@ object LocalEngine {
                     }
                 }
             }
-            // If an accelerator can't run this model (unsupported operation, out of memory, driver error): try without the NPU,
-            // then on the CPU alone, and say what happened.
-            val fallbacks = listOfNotNull(key, key.gpu?.split(',')?.filterNot { it.startsWith("HTP") }?.takeIf { it.isNotEmpty() && it.size < key.gpu.split(',').size }
-                ?.let { key.copy(gpu = it.joinToString(",")) }, key.copy(gpu = null)).distinct()
+            // If an accelerator can't run this model (unsupported operation, out of memory, driver error), try the next option:
+            // NPU + GPU → that GPU alone → the GPU through its other API (OpenCL ↔ Vulkan) → CPU. Combinations that failed for this
+            // model are skipped for the rest of the session, and the reason is shown.
+            val devs = devices()
+            val gpuOnly = key.gpu?.split(',')?.filterNot { it.startsWith("HTP") }?.joinToString(",")?.ifBlank { null }
+            val otherApi = gpuOnly?.let { g -> devs.firstOrNull { !it.isNpu && it.name != g && g.split(',').none { n -> n == it.name } }?.name }
+            // Accelerator options in order, then the CPU (null) last, which is always tried.
+            val plan = (listOfNotNull(key.gpu, gpuOnly, otherApi) + listOf<String?>(null)).distinct()
+                .filter { g -> g == null || "${file.path}|$g" !in failedCombos }
+            gpuFailures = ""
             var lastError: ApiException? = null
-            for ((i, k) in fallbacks.withIndex()) {
+            for ((i, g) in plan.withIndex()) {
+                val k = key.copy(gpu = g)
+                if (i > 0 && lastError != null) gpuNote = (if (g == null) "The GPU/NPU couldn't run this model, so it's running on the CPU"
+                    else "${plan[i - 1]} couldn't run this model, so it's using $g") + ": " + failureReason(lastError)
                 try {
                     attempt(k)
-                    if (i > 0) gpuNote = (if (k.gpu == null) "The GPU/NPU couldn't run this model, so it's running on the CPU." else "The NPU couldn't run this model, so it's using the GPU and CPU.") +
-                        " (${lastError?.message?.lines()?.firstOrNull()?.take(120)})"
                     lastError = null
                     break
                 } catch (e: ApiException) {
-                    if ("Android stopped the engine" in (e.message ?: "") || k.gpu == null) throw e
+                    if ("Android stopped the engine" in (e.message ?: "") || g == null) throw e
+                    failedCombos += "${file.path}|$g"
+                    gpuFailures += "\n[$g failed]\n" + recentLog(40)
                     lastError = e
                 }
             }

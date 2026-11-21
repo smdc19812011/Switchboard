@@ -245,7 +245,7 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
             Row(verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = {
                     probe = "Checking… (the first check can take up to a minute while the GPU compiles its programs)"
-                    probeScope.launch { devices = LocalEngine.devices(force = true); probe = LocalEngine.lastProbe }
+                    probeScope.launch { devices = LocalEngine.devices(force = true); probe = LocalEngine.lastProbe + LocalEngine.gpuFailures.let { f -> if (f.isBlank()) "" else "\n\nLast GPU/NPU attempts that failed:$f" } }
                 }) { Text("Check GPU/NPU") }
                 if (probe != null && !probe!!.startsWith("Checking")) TextButton(onClick = {
                     val cm = vm.getApplication<android.app.Application>().getSystemService(android.content.ClipboardManager::class.java)
@@ -253,7 +253,7 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
                 }) { Text("Copy") }
             }
             probe?.let {
-                Text(it.lines().filter { l -> l.isNotBlank() }.takeLast(25).joinToString("\n"), style = MaterialTheme.typography.labelSmall,
+                Text(it.lines().filter { l -> l.isNotBlank() }.takeLast(60).joinToString("\n"), style = MaterialTheme.typography.labelSmall,
                     fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if (chosen.isNotEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
