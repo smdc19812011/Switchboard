@@ -126,7 +126,7 @@ class LocalGpuTest {
             assertTrue("$gpu", gpu.gpu!!.endsWith("(Vulkan)") && gpu.gpuLayers!!.matches(Regex("\\d+/\\d+")))
 
             // The GPU fails while answering (as Vulkan's "ErrorDeviceLost" did on the phone, taking the engine down): the same
-            // message is answered again on the next option (here the CPU), and the status says why.
+            // message is answered again on the next option (here half the layers on the GPU, the rest on the CPU), and the status says why.
             val long = (1..300).joinToString(" ") { "word$it" }
             val pid = File(LocalEngine.stateDir, "llama-server.pid").readText().trim()
             val killer = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
@@ -137,7 +137,8 @@ class LocalGpuTest {
             killer.cancel()
             assertTrue("$again", again.last() is StreamEvent.TurnEnd)
             val after = LocalEngine.progress.value!!
-            assertNull("${after} // failures=${LocalEngine.gpuFailures} // killed=${killer.isCompleted} // events=${again.size}", after.gpu)
+            assertTrue("${after} // failures=${LocalEngine.gpuFailures} // killed=${killer.isCompleted} // events=${again.size}",
+                after.gpu == null || after.gpuLayers != gpu.gpuLayers)
             assertTrue("${after.gpuNote}", after.gpuNote!!.contains("failed while answering"))
             LocalEngine.stop()
 
@@ -154,7 +155,8 @@ class LocalGpuTest {
             val fb = LocalEngine.progress.value!!
             assertNull(fb.gpu)
             assertTrue("${fb.gpuNote}", fb.gpuNote!!.startsWith("The GPU/NPU couldn't run this model, so it's running on the CPU: ") && "no GPU or NPU was detected" !in fb.gpuNote!!)
-            assertTrue(LocalEngine.gpuFailures, LocalEngine.gpuFailures.contains("[HTP0,Vulkan7 failed]") && LocalEngine.gpuFailures.contains("[Vulkan7 failed]"))
+            assertTrue(LocalEngine.gpuFailures, LocalEngine.gpuFailures.contains("[HTP0,Vulkan7 failed]") && LocalEngine.gpuFailures.contains("[Vulkan7 failed]") &&
+                LocalEngine.gpuFailures.contains("[Vulkan7 (1 layers) failed]")) // half the layers is tried before the CPU
             LocalEngine.deviceOverride = null
 
             // Asking for OpenCL where there is none: no GPU device, so it runs on the CPU rather than failing.

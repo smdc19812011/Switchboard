@@ -54,6 +54,13 @@ class GgufInfoTest {
         assertEquals("unsloth/Qwen3-4B-Instruct-2507", GgufInfo.guessSourceFromLink("https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"))
         assertEquals(null, GgufInfo.guessSourceFromLink("https://huggingface.co/Qwen/Qwen3-4B/resolve/main/x.gguf"))
         assertEquals(-1, GgufInfo.read(header("llama", 0, 0).inputStream()).fileType) // older files without it
+        // The Snapdragon NPU runs Q* / IQ4_NL / MXFP4 files, not IQ1-IQ3 ones (the phone's Qwen3.5 IQ2_M file).
+        assertTrue(GgufInfo(fileType = 15).npuSupportsQuant)   // Q4_K_M
+        assertTrue(GgufInfo(fileType = 2).npuSupportsQuant)    // Q4_0
+        assertTrue(GgufInfo(fileType = 25).npuSupportsQuant)   // IQ4_NL
+        assertTrue(!GgufInfo(fileType = 29).npuSupportsQuant)  // IQ2_M
+        assertTrue(!GgufInfo(fileType = 23).npuSupportsQuant)  // IQ3_XXS
+        assertTrue(GgufInfo().npuSupportsQuant)                // unknown: allowed
     }
 
     @Test fun moeNamesAndFit() {

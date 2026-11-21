@@ -14,6 +14,8 @@ data class GgufInfo(
     val architecture: String? = null, val name: String? = null, val expertCount: Int = 0, val expertUsed: Int = 0, val contextLength: Int = 0,
     /** llama.cpp's general.file_type (quantization), or -1. */
     val fileType: Int = -1,
+    /** Number of transformer layers ({arch}.block_count), or 0. */
+    val blockCount: Int = 0,
     /** Links the converter recorded: base model repo, source repo, ... (in order of usefulness). */
     val sourceUrls: List<String> = emptyList(),
 ) {
@@ -22,6 +24,12 @@ data class GgufInfo(
 
     /** The quantization as llama-quantize names it ("Q4_K_M"), or null when unknown. */
     val quantName: String? get() = QUANTS[fileType]
+
+    /**
+     * Whether the Snapdragon NPU (Hexagon backend) can run this file's main weights: the Q* formats, IQ4_NL and MXFP4, not the
+     * IQ1/IQ2/IQ3/IQ4_XS ones. Unknown formats are allowed.
+     */
+    val npuSupportsQuant: Boolean get() = quantName?.let { q -> q.startsWith("Q") || q == "IQ4_NL" || q.startsWith("MXFP4") || q == "F16" || q == "F32" } ?: true
 
     /** Mixture of Experts: each token only uses [expertUsed] of [expertCount] experts, so the model can run larger than RAM. */
     val isMoe get() = expertCount > 1
@@ -51,7 +59,7 @@ data class GgufInfo(
             val arch = kv["general.architecture"] as? String
             fun int(k: String) = (kv["$arch.$k"] as? Number)?.toInt() ?: 0
             return GgufInfo(arch, kv["general.name"] as? String, int("expert_count"), int("expert_used_count"), int("context_length"),
-                (kv["general.file_type"] as? Number)?.toInt() ?: -1, urlKeys.mapNotNull { kv[it] as? String })
+                (kv["general.file_type"] as? Number)?.toInt() ?: -1, int("block_count"), urlKeys.mapNotNull { kv[it] as? String })
         }
 
         /** "org/name" from a Hugging Face URL (or a bare "org/name"), else null. */

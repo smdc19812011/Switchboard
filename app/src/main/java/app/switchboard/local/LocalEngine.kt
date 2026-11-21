@@ -53,6 +53,8 @@ object LocalEngine {
         // only searches the folders listed here), then the GPU/NPU drivers in /vendor.
         "LD_LIBRARY_PATH" to listOfNotNull(bin.parentFile?.path, "/system/lib64", "/vendor/lib64", "/system/vendor/lib64", "/odm/lib64").joinToString(":"),
         // Where the Snapdragon NPU loader finds the NPU-side programs (libggml-htp-v73…v85.so, shipped next to the engine).
+        // Adreno: allow single GPU buffers above the driver's normal limit (else a ~2 GB block of weights fails with -61).
+        "GGML_OPENCL_ADRENO_USE_LARGE_BUFFER" to "1",
         "ADSP_LIBRARY_PATH" to listOfNotNull(bin.parentFile?.path, "/vendor/lib/rfsa/adsp", "/vendor/lib/rfsa/cdsp", "/vendor/dsp/cdsp", "/vendor/dsp", "/system/lib/rfsa/adsp").joinToString(";"),
     ) + extraEnv
 
@@ -141,7 +143,7 @@ object LocalEngine {
      */
     suspend fun acceleratorFailed(reason: String) {
         val k = running ?: return
-        failedCombos += "${k.path}|${k.gpu}"
+        failedCombos += "${k.path}|${k.gpu}" + (if (k.gpuLayers >= 0) " (${k.gpuLayers} layers)" else "")
         gpuFailures += "\n[${k.gpu} failed while answering]\n$reason\n" + recentLog(30)
         carryNote = "${k.gpu} failed while answering (${reason.take(120)}), so it switched"
         stop()
@@ -326,7 +328,11 @@ object LocalEngine {
         if (lm.path.isBlank()) throw ApiException("${p.name}: no model file yet. Edit the provider to download a .gguf or choose one on the phone.")
         if (File(lm.path + ".part").exists() && !file.exists()) throw ApiException("${p.name}: the model is still downloading.")
         if (!file.canRead()) throw ApiException("${p.name}: can't read ${lm.path}. Choose the file again (or allow All files access).")
-        val device = pickDevices(devices(), lm.processor, lm.gpuBackend).joinToString(",") { it.name }.ifBlank { null }
+        val header = runCatching { file.inputStream().use { GgufInfo.read(it) } }.getOrNull()
+        // The NPU can't run IQ1/IQ2/IQ3 files: leave it out for those (the GPU and CPU do the work) and say so.
+        val skipNpu = header?.npuSupportsQuant == false && lm.processor != "cpu"
+        val quantNote = if (skipNpu && devices().any { it.isNpu }) "the NPU doesn't support ${header?.quantName} files (use Q4_0/Q4_K_M/IQ4_NL for the NPU)" else null
+        val device = pickDevices(devices().filter { !(skipNpu && it.isNpu) }, lm.processor, lm.gpuBackend).joinToString(",") { it.name }.ifBlank { null }
         cpuOnlyByChoice = lm.processor == "cpu"
         val key = Key(file.path, lm.contextSize.coerceIn(512, 262_144), lm.threads, p.apiKey, lm.largeMode, device, lm.gpuLayers)
         keepMs = lm.keepMinutes.coerceAtLeast(1) * 60_000L
@@ -358,24 +364,28 @@ object LocalEngine {
             // On Adreno, OpenCL is the supported route and Vulkan tends to lose the device mid-reply: only use it when chosen.
             val otherApi = gpuOnly?.takeIf { devs.none { d -> d.description.contains("Adreno", true) } }
                 ?.let { g -> devs.firstOrNull { !it.isNpu && it.name != g && g.split(',').none { n -> n == it.name } }?.name }
-            // Accelerator options in order, then the CPU (null) last, which is always tried.
-            val plan = (listOfNotNull(key.gpu, gpuOnly, otherApi) + listOf<String?>(null)).distinct()
-                .filter { g -> g == null || "${file.path}|$g" !in failedCombos }
+            // Accelerator options in order, then the CPU (null) last, which is always tried. When the GPU can't allocate all the
+            // layers it would take, half of them on the GPU (the rest on the CPU) is tried before giving up on it.
+            data class Option(val gpu: String?, val layers: Int?) { val label get() = (gpu ?: "CPU") + (layers?.let { " ($it layers)" } ?: "") }
+            val half = header?.blockCount?.takeIf { it > 1 && lm.gpuLayers < 0 }?.let { it / 2 }
+            val plan = (listOfNotNull(key.gpu?.let { Option(it, null) }, gpuOnly?.let { Option(it, null) }, gpuOnly?.let { g -> half?.let { Option(g, it) } },
+                otherApi?.let { Option(it, null) }) + Option(null, null)).distinct()
+                .filter { o -> o.gpu == null || "${file.path}|${o.label}" !in failedCombos }
             if (carryNote == null) gpuFailures = ""
-            gpuNote = carryNote; carryNote = null
+            gpuNote = carryNote ?: quantNote; carryNote = null
             var lastError: ApiException? = null
-            for ((i, g) in plan.withIndex()) {
-                val k = key.copy(gpu = g)
-                if (i > 0 && lastError != null) gpuNote = (if (g == null) "The GPU/NPU couldn't run this model, so it's running on the CPU"
-                    else "${plan[i - 1]} couldn't run this model, so it's using $g") + ": " + failureReason(lastError)
+            for ((i, o) in plan.withIndex()) {
+                val k = key.copy(gpu = o.gpu, gpuLayers = o.layers ?: key.gpuLayers)
+                if (i > 0 && lastError != null) gpuNote = (if (o.gpu == null) "The GPU/NPU couldn't run this model, so it's running on the CPU"
+                    else "${plan[i - 1].label} couldn't run this model, so it's using ${o.label}") + ": " + failureReason(lastError)
                 try {
                     attempt(k)
                     lastError = null
                     break
                 } catch (e: ApiException) {
-                    if ("Android stopped the engine" in (e.message ?: "") || g == null) throw e
-                    failedCombos += "${file.path}|$g"
-                    gpuFailures += "\n[$g failed]\n" + recentLog(40)
+                    if ("Android stopped the engine" in (e.message ?: "") || o.gpu == null) throw e
+                    failedCombos += "${file.path}|${o.label}"
+                    gpuFailures += "\n[${o.label} failed]\n" + recentLog(40)
                     lastError = e
                 }
             }
