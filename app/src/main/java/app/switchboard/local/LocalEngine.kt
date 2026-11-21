@@ -65,7 +65,8 @@ object LocalEngine {
         val bin = binary ?: return@withContext emptyList()
         if (!force) deviceCache?.takeIf { it.first == bin.path }?.let { return@withContext it.second }
         val found = runCatching {
-            val pb = ProcessBuilder(bin.path, "--list-devices").redirectErrorStream(true)
+            // -lv 4 first, so the backend loader's messages (which library failed and why) are printed too.
+            val pb = ProcessBuilder(bin.path, "-lv", "4", "--list-devices").redirectErrorStream(true)
             pb.environment().putAll(engineEnv(bin))
             val p = pb.start()
             val out = p.inputStream.bufferedReader().readText()
@@ -80,6 +81,11 @@ object LocalEngine {
     }
 
     @Volatile private var cpuOnlyByChoice: Boolean? = null
+
+    /** The most telling line from the last GPU/NPU check when it found nothing (e.g. which driver library failed to load). */
+    fun probeProblem(): String? = lastProbe.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        .firstOrNull { Regex("(?i)fail|error|not found|cannot|denied|unable|no device|not accessible").containsMatchIn(it) }
+        ?.replace(Regex("^[0-9.]+ [A-Z] "), "")?.take(200)
 
     /** What the last GPU/NPU check printed (for the "Check GPU/NPU" details). */
     @Volatile var lastProbe: String = ""
@@ -323,7 +329,8 @@ object LocalEngine {
         _status.value = name
         val (gpuName, offloaded) = placementFromLog(p.log(5000)) // the whole loading log: big models print hundreds of lines
         _progress.value = _progress.value?.copy(phase = Phase.IDLE, gpu = if (key.gpu == null) null else gpuName ?: key.gpu, gpuLayers = if (key.gpu == null) null else offloaded,
-            gpuNote = gpuNote ?: if (key.gpu == null && cpuOnlyByChoice != true) "no GPU or NPU was detected (see Check GPU/NPU in the model's settings)" else null)
+            gpuNote = gpuNote ?: if (key.gpu == null && cpuOnlyByChoice != true)
+                "no GPU or NPU was detected" + (probeProblem()?.let { ": $it" } ?: "") + " (details: Check GPU/NPU in the model's settings)" else null)
         startIdleWatch()
     }
 
