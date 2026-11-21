@@ -137,8 +137,18 @@ object LocalEngine {
     }
 
     /** Engine arguments: the accelerators (layers split between them, the rest on the CPU), or CPU only. */
-    fun gpuArgs(device: String?, layers: Int): List<String> =
-        if (device.isNullOrBlank()) listOf("-dev", "none") else listOf("-dev", device, "-ngl", if (layers < 0) "auto" else "$layers")
+    fun gpuArgs(device: String?, layers: Int): List<String> {
+        if (device.isNullOrBlank()) return listOf("-dev", "none")
+        val devs = device.split(',')
+        // The Hexagon NPU reports 0 MiB ("no limit"), which llama.cpp's automatic fit and memory-proportional split read as
+        // "no room": with the NPU involved, place layers explicitly (all of them, shared evenly with a GPU). If that doesn't
+        // fit, the engine falls back to GPU + CPU with the automatic fit.
+        if (devs.any { it.startsWith("HTP") }) {
+            return listOf("-dev", device, "-ngl", if (layers < 0) "all" else "$layers", "-fit", "off") +
+                if (devs.size > 1) listOf("-ts", devs.joinToString(",") { "1" }) else emptyList()
+        }
+        return listOf("-dev", device, "-ngl", if (layers < 0) "auto" else "$layers")
+    }
 
     /** Set when the GPU failed for the loaded model and it fell back to the CPU, for the status line. */
     @Volatile var gpuNote: String? = null; private set

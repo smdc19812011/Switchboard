@@ -68,7 +68,13 @@ class LocalGpuTest {
         assertEquals(listOf("HTP0"), pick("npu"))
         assertEquals(emptyList<String>(), pick("cpu"))
         assertEquals(listOf("GPUOpenCL"), LocalEngine.pickDevices(devs.drop(0).filter { !it.isNpu }, "auto", "auto").map { it.name }) // no NPU: GPU only
-        assertEquals(listOf("-dev", "HTP0,GPUOpenCL", "-ngl", "auto"), LocalEngine.gpuArgs("HTP0,GPUOpenCL", -1))
+        // The NPU reports 0 MiB (= no limit), so layers are placed explicitly: all of them, shared evenly with the GPU.
+        assertEquals(listOf("-dev", "HTP0,GPUOpenCL", "-ngl", "all", "-fit", "off", "-ts", "1,1"), LocalEngine.gpuArgs("HTP0,GPUOpenCL", -1))
+        assertEquals(listOf("-dev", "HTP0", "-ngl", "all", "-fit", "off"), LocalEngine.gpuArgs("HTP0", -1))
+        assertEquals(listOf("-dev", "HTP0", "-ngl", "20", "-fit", "off"), LocalEngine.gpuArgs("HTP0", 20))
+        // Exactly what the Snapdragon 8 Gen 5 reported (Adreno 840 + Hexagon v81).
+        val real = LocalEngine.parseDevices("Available devices:\n  Vulkan0: Adreno (TM) 840 (15195 MiB, 15195 MiB free)\n  GPUOpenCL: QUALCOMM Adreno(TM) 840 (5542 MiB, 4518 MiB free)\n  HTP0: Hexagon (0 MiB, 0 MiB free)")
+        assertEquals(listOf("HTP0", "GPUOpenCL"), LocalEngine.pickDevices(real, "auto", "auto").map { it.name })
         val log = """
             I llama_prepare_model_devices: using device HTP0 (Hexagon) - 2048 MiB free
             I llama_prepare_model_devices: using device GPUOpenCL (QUALCOMM Adreno(TM) 830) - 7680 MiB free
