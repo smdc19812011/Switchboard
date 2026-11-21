@@ -49,6 +49,37 @@ class LocalGpuTest {
         assertTrue(all.second!!.contains("all 36 layers on the GPU"))
     }
 
+    /** A Snapdragon 8 Elite-class phone: NPU (Hexagon HTP) plus the Adreno GPU seen through OpenCL and Vulkan. */
+    @Test fun npuGpuAndCpu() {
+        val devs = LocalEngine.parseDevices("""
+            Available devices:
+              HTP0: Hexagon (2048 MiB, 2048 MiB free)
+              GPUOpenCL: QUALCOMM Adreno(TM) 830 (7680 MiB, 7680 MiB free)
+              Vulkan0: Adreno (TM) 830 (11520 MiB, 11520 MiB free)
+        """.trimIndent())
+        assertTrue(devs[0].isNpu && devs[0].api == "Hexagon")
+        fun pick(p: String, b: String = "auto") = LocalEngine.pickDevices(devs, p, b).map { it.name }
+        assertEquals(listOf("HTP0", "GPUOpenCL"), pick("auto"))            // NPU + one GPU (never OpenCL and Vulkan together)
+        assertEquals(listOf("HTP0", "Vulkan0"), pick("auto", "vulkan"))
+        assertEquals(listOf("GPUOpenCL"), pick("gpu"))
+        assertEquals(listOf("HTP0"), pick("npu"))
+        assertEquals(emptyList<String>(), pick("cpu"))
+        assertEquals(listOf("GPUOpenCL"), LocalEngine.pickDevices(devs.drop(0).filter { !it.isNpu }, "auto", "auto").map { it.name }) // no NPU: GPU only
+        assertEquals(listOf("-dev", "HTP0,GPUOpenCL", "-ngl", "auto"), LocalEngine.gpuArgs("HTP0,GPUOpenCL", -1))
+        val log = """
+            I llama_prepare_model_devices: using device HTP0 (Hexagon) - 2048 MiB free
+            I llama_prepare_model_devices: using device GPUOpenCL (QUALCOMM Adreno(TM) 830) - 7680 MiB free
+            I load_tensors: offloaded 29/29 layers to GPU
+        """.trimIndent()
+        val placed = LocalEngine.placementFromLog(log)
+        assertEquals("Hexagon (Hexagon) + QUALCOMM Adreno(TM) 830 (OpenCL)" to "29/29", placed)
+        val gb = 1L shl 30
+        val line = localStatusLines(LocalEngine.Progress(LocalEngine.Phase.IDLE, "m", 2 * gb, 2 * gb, gpu = placed.first, gpuLayers = "20/29")).second!!
+        assertTrue(line, line.contains("NPU + GPU: Hexagon (Hexagon) + QUALCOMM Adreno(TM) 830 (OpenCL) · 20 of 29 layers on the NPU and GPU, the rest on the CPU"))
+        val npuOnly = localStatusLines(LocalEngine.Progress(LocalEngine.Phase.IDLE, "m", 2 * gb, 2 * gb, gpu = "Hexagon (Hexagon)", gpuLayers = "29/29")).second!!
+        assertTrue(npuOnly, npuOnly.contains("NPU: Hexagon (Hexagon) · all 29 layers on the NPU"))
+    }
+
     /**
      * With a GPU build of llama-server and a software Vulkan GPU (Mesa lavapipe): set LLAMA_SERVER_GPU and TINY_GGUF.
      * The engine finds the GPU, splits the model onto it, and runs CPU-only when asked.

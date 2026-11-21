@@ -32,13 +32,15 @@ object LocalEngine {
     @Volatile var launcher: EngineLauncher = InProcessLauncher
     const val PORT = 8737
 
-    /** [gpu]: device name to offload to (null = CPU only), [gpuLayers] -1 = as many as fit. */
+    /** [gpu]: devices to offload to, comma-separated (null = CPU only), [gpuLayers] -1 = as many as fit. */
     private data class Key(val path: String, val ctx: Int, val threads: Int, val apiKey: String, val large: Boolean = false,
                            val gpu: String? = null, val gpuLayers: Int = -1)
 
     /** A GPU the engine can use, as `--list-devices` reports it (e.g. GPUOpenCL: QUALCOMM Adreno(TM) 650). */
     data class GpuDevice(val name: String, val description: String, val totalMiB: Long, val freeMiB: Long) {
-        val api get() = when { name.startsWith("Vulkan") -> "Vulkan"; name.contains("OpenCL") -> "OpenCL"; else -> name }
+        val api get() = when { name.startsWith("Vulkan") -> "Vulkan"; name.contains("OpenCL") -> "OpenCL"; name.startsWith("HTP") -> "Hexagon"; else -> name }
+        /** The Snapdragon NPU (Hexagon HTP); everything else here is a GPU. */
+        val isNpu get() = name.startsWith("HTP")
     }
 
     /** Extra environment for the engine (tests use it to expose a software GPU). */
@@ -46,7 +48,11 @@ object LocalEngine {
     @Volatile private var deviceCache: Pair<String, List<GpuDevice>>? = null
 
     /** Library folders for the engine: its own, then the phone's GPU drivers (the OpenCL driver lives in /vendor). */
-    private fun engineEnv(bin: File) = mapOf("LD_LIBRARY_PATH" to listOfNotNull(bin.parentFile?.path, "/vendor/lib64", "/system/vendor/lib64", "/odm/lib64").joinToString(":")) + extraEnv
+    private fun engineEnv(bin: File) = mapOf(
+        "LD_LIBRARY_PATH" to listOfNotNull(bin.parentFile?.path, "/vendor/lib64", "/system/vendor/lib64", "/odm/lib64").joinToString(":"),
+        // Where the Snapdragon NPU loader finds the NPU-side programs (libggml-htp-v73…v85.so, shipped next to the engine).
+        "ADSP_LIBRARY_PATH" to listOfNotNull(bin.parentFile?.path, "/vendor/lib/rfsa/adsp", "/vendor/lib/rfsa/cdsp", "/vendor/dsp/cdsp", "/vendor/dsp", "/system/lib/rfsa/adsp").joinToString(";"),
+    ) + extraEnv
 
     /** Parses `--list-devices` output. */
     fun parseDevices(out: String): List<GpuDevice> = out.lines().mapNotNull { l ->
@@ -69,15 +75,33 @@ object LocalEngine {
     }
 
     /** The one GPU to use (the same GPU often appears through both OpenCL and Vulkan; using both would split it in two). */
-    fun pickDevice(devices: List<GpuDevice>, backend: String): GpuDevice? = when (backend) {
-        "opencl" -> devices.firstOrNull { it.api == "OpenCL" }
-        "vulkan" -> devices.firstOrNull { it.api == "Vulkan" }
-        else -> devices.firstOrNull { it.api == "OpenCL" } ?: devices.firstOrNull { it.api == "Vulkan" }
+    fun pickDevice(devices: List<GpuDevice>, backend: String): GpuDevice? {
+        val gpus = devices.filter { !it.isNpu }
+        return when (backend) {
+            "opencl" -> gpus.firstOrNull { it.api == "OpenCL" }
+            "vulkan" -> gpus.firstOrNull { it.api == "Vulkan" }
+            else -> gpus.firstOrNull { it.api == "OpenCL" } ?: gpus.firstOrNull { it.api == "Vulkan" }
+        }
     }
 
-    /** Engine arguments for the processor choice: one GPU plus the CPU, or CPU only. */
+    /**
+     * Accelerators for a processor choice: "auto" = NPU + one GPU, "gpu" = one GPU, "npu" = the NPU, "cpu" = none.
+     * The CPU always runs whatever the accelerators don't hold.
+     */
+    fun pickDevices(devices: List<GpuDevice>, processor: String, backend: String): List<GpuDevice> {
+        val npu = devices.firstOrNull { it.isNpu }
+        val gpu = pickDevice(devices, backend)
+        return when (processor) {
+            "cpu" -> emptyList()
+            "gpu" -> listOfNotNull(gpu)
+            "npu" -> listOfNotNull(npu)
+            else -> listOfNotNull(npu, gpu)
+        }
+    }
+
+    /** Engine arguments: the accelerators (layers split between them, the rest on the CPU), or CPU only. */
     fun gpuArgs(device: String?, layers: Int): List<String> =
-        if (device == null) listOf("-dev", "none") else listOf("-dev", device, "-ngl", if (layers < 0) "auto" else "$layers")
+        if (device.isNullOrBlank()) listOf("-dev", "none") else listOf("-dev", device, "-ngl", if (layers < 0) "auto" else "$layers")
 
     /** Set when the GPU failed for the loaded model and it fell back to the CPU, for the status line. */
     @Volatile var gpuNote: String? = null; private set
@@ -210,7 +234,7 @@ object LocalEngine {
         if (lm.path.isBlank()) throw ApiException("${p.name}: no model file yet. Edit the provider to download a .gguf or choose one on the phone.")
         if (File(lm.path + ".part").exists() && !file.exists()) throw ApiException("${p.name}: the model is still downloading.")
         if (!file.canRead()) throw ApiException("${p.name}: can't read ${lm.path}. Choose the file again (or allow All files access).")
-        val device = if (lm.processor == "cpu") null else pickDevice(devices(), lm.gpuBackend)?.name
+        val device = pickDevices(devices(), lm.processor, lm.gpuBackend).joinToString(",") { it.name }.ifBlank { null }
         val key = Key(file.path, lm.contextSize.coerceIn(512, 262_144), lm.threads, p.apiKey, lm.largeMode, device, lm.gpuLayers)
         keepMs = lm.keepMinutes.coerceAtLeast(1) * 60_000L
         touch()
@@ -233,13 +257,24 @@ object LocalEngine {
                     }
                 }
             }
-            try { attempt(key) }
-            catch (e: ApiException) {
-                // A GPU driver that can't run this model (unsupported operation, out of GPU memory, crash): run it on the CPU instead.
-                if (key.gpu == null || "Android stopped the engine" in (e.message ?: "")) throw e
-                gpuNote = "The GPU couldn't run this model, so it's running on the CPU. (${e.message?.lines()?.firstOrNull()?.take(120)})"
-                attempt(key.copy(gpu = null))
+            // If an accelerator can't run this model (unsupported operation, out of memory, driver error): try without the NPU,
+            // then on the CPU alone, and say what happened.
+            val fallbacks = listOfNotNull(key, key.gpu?.split(',')?.filterNot { it.startsWith("HTP") }?.takeIf { it.isNotEmpty() && it.size < key.gpu.split(',').size }
+                ?.let { key.copy(gpu = it.joinToString(",")) }, key.copy(gpu = null)).distinct()
+            var lastError: ApiException? = null
+            for ((i, k) in fallbacks.withIndex()) {
+                try {
+                    attempt(k)
+                    if (i > 0) gpuNote = (if (k.gpu == null) "The GPU/NPU couldn't run this model, so it's running on the CPU." else "The NPU couldn't run this model, so it's using the GPU and CPU.") +
+                        " (${lastError?.message?.lines()?.firstOrNull()?.take(120)})"
+                    lastError = null
+                    break
+                } catch (e: ApiException) {
+                    if ("Android stopped the engine" in (e.message ?: "") || k.gpu == null) throw e
+                    lastError = e
+                }
             }
+            lastError?.let { throw it }
         } }
         touch()
     }
@@ -294,14 +329,13 @@ object LocalEngine {
         return (if (isSamsung) "; on this phone, also set RAM Plus to its largest size (Settings > Battery and device care > Memory > RAM Plus) so Android can park other apps on storage" else "") + "$free."
     }
 
-    /** From the engine's loading log: the GPU it used ("Adreno (TM) 650 (OpenCL)") and the layers on it ("28/36"). */
+    /** From the engine's loading log: the accelerators it used ("Hexagon HTP0 (Hexagon) + Adreno 830 (OpenCL)") and the layers on them ("28/36"). */
     fun placementFromLog(log: String): Pair<String?, String?> {
-        val dev = Regex("using device (\\S+) \\((.+?)\\)(?: \\(| -)").find(log)?.let { m ->
-            val api = GpuDevice(m.groupValues[1], "", 0, 0).api
-            "${m.groupValues[2]} ($api)"
-        }
+        val devs = Regex("using device (\\S+) \\((.+?)\\)(?: \\(| -|$)", RegexOption.MULTILINE).findAll(log).map { m ->
+            "${m.groupValues[2]} (${GpuDevice(m.groupValues[1], "", 0, 0).api})"
+        }.distinct().toList()
         val layers = Regex("offloaded (\\d+)/(\\d+) layers to GPU").findAll(log).lastOrNull()?.let { "${it.groupValues[1]}/${it.groupValues[2]}" }
-        return dev to layers
+        return devs.joinToString(" + ").ifBlank { null } to layers
     }
 
     private fun explain(log: String, exit: Int = 0): String {

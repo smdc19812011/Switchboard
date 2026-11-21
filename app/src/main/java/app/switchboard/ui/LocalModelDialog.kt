@@ -214,27 +214,36 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
                 OutlinedTextField(keep, { keep = it.filter(Char::isDigit).take(4) }, label = { Text("Unload after") }, singleLine = true,
                     supportingText = { Text("idle min") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f))
             }
-            // Processor: GPU + CPU (split automatically) or CPU only.
+            // Processor: which accelerators share the model with the CPU.
+            val devs = devices
+            val hasNpu = devs?.any { it.isNpu } == true
+            val hasGpu = devs?.any { !it.isNpu } == true
+            val choices = buildList {
+                if (hasNpu && hasGpu) add("auto" to "All") else add("auto" to "Auto")
+                if (hasNpu && hasGpu) { add("gpu" to "GPU"); add("npu" to "NPU") }
+                add("cpu" to "CPU only")
+            }
             Text("Processor", style = MaterialTheme.typography.labelMedium)
             androidx.compose.material3.SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-                listOf("auto" to "GPU + CPU", "cpu" to "CPU only").forEachIndexed { i, (id, label) ->
-                    SegmentedButton(selected = processor == id, onClick = { processor = id },
-                        shape = androidx.compose.material3.SegmentedButtonDefaults.itemShape(i, 2)) { Text(label) }
+                choices.forEachIndexed { i, (id, label) ->
+                    SegmentedButton(selected = processor == id || (id == "auto" && choices.none { it.first == processor }), onClick = { processor = id },
+                        shape = androidx.compose.material3.SegmentedButtonDefaults.itemShape(i, choices.size)) { Text(label, maxLines = 1) }
                 }
             }
-            val devs = devices
-            val chosen = devs?.let { LocalEngine.pickDevice(it, gpuBackend) }
+            val chosen = devs?.let { LocalEngine.pickDevices(it, processor, gpuBackend) }.orEmpty()
             Text(when {
-                devs == null -> "Looking for a GPU…"
-                devs.isEmpty() -> "No usable GPU found on this phone, so it runs on the CPU."
-                processor == "cpu" -> "GPU available (${devs.joinToString { "${it.description} via ${it.api}" }}) but not used."
-                else -> "Uses ${chosen?.description ?: "the GPU"} via ${chosen?.api ?: "?"} for as many layers as fit in its memory, and the CPU for the rest. If the GPU can't run a model, it switches to the CPU by itself."
+                devs == null -> "Looking for a GPU and NPU…"
+                devs.isEmpty() -> "No usable GPU or NPU found on this phone, so it runs on the CPU."
+                processor == "cpu" -> "Found ${devs.joinToString { "${it.description} (${it.api})" }}, not used: CPU only."
+                chosen.isEmpty() -> "That isn't available here, so it runs on the CPU."
+                else -> "Shares the model between ${chosen.joinToString(" + ") { (if (it.isNpu) "NPU " else "GPU ") + it.description + " (" + it.api + ")" }} and the CPU: " +
+                    "as many layers as fit go on the ${if (chosen.size > 1) "NPU and GPU" else if (chosen[0].isNpu) "NPU" else "GPU"}, the rest run on the CPU. If they can't run a model, it falls back by itself."
             }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (processor != "cpu" && !devs.isNullOrEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (chosen.isNotEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(gpuLayers, { gpuLayers = it.filter(Char::isDigit).take(3) }, label = { Text("GPU layers") }, placeholder = { Text("Auto") },
                     singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f),
                     supportingText = { Text("blank = as many as fit") })
-                if (devs.map { it.api }.distinct().size > 1) {
+                if (devs.orEmpty().filter { !it.isNpu }.map { it.api }.distinct().size > 1 && processor != "npu") {
                     var menu by remember { mutableStateOf(false) }
                     androidx.compose.foundation.layout.Box(Modifier.weight(1f)) {
                         OutlinedButton(onClick = { menu = true }) { Text(when (gpuBackend) { "opencl" -> "OpenCL"; "vulkan" -> "Vulkan"; else -> "Auto" }) }

@@ -62,7 +62,7 @@ data class LocalModel(
      * compressed conversation cache and smaller work buffers, so models larger than RAM (especially MoE) can run.
      */
     val largeMode: Boolean = false,
-    /** "auto": GPU + CPU (as many layers on the GPU as fit, the rest on the CPU); "cpu": CPU only. */
+    /** "auto": NPU + GPU + CPU (whatever the phone has); "gpu": GPU + CPU; "npu": NPU + CPU; "cpu": CPU only. */
     val processor: String = "auto",
     /** Layers on the GPU: -1 = as many as fit, otherwise that many. */
     val gpuLayers: Int = -1,

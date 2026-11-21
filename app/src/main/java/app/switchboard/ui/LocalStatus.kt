@@ -37,10 +37,15 @@ fun localStatusLines(pr: LocalEngine.Progress): Pair<String, String?> {
         (if (pr.phase == LocalEngine.Phase.READING || pr.phase == LocalEngine.Phase.WRITING) " · ${pr.busyThreads} busy now" else "") else null
     // Where the model runs: the GPU and its share of the layers (the rest on the CPU), or the CPU alone.
     val processor = when {
-        pr.gpu != null -> "GPU: ${pr.gpu}" + (pr.gpuLayers?.let { l ->
-            val (on, all) = l.split('/').map { it.toIntOrNull() ?: 0 }.let { it[0] to it.getOrElse(1) { 0 } }
-            if (on >= all && all > 0) " · all $all layers on the GPU" else " · $on of $all layers on the GPU, the rest on the CPU"
-        } ?: "")
+        pr.gpu != null -> {
+            val npu = "(Hexagon)" in pr.gpu; val both = " + " in pr.gpu
+            val what = when { both -> "NPU + GPU"; npu -> "NPU"; else -> "GPU" }
+            val where = if (both) "on the NPU and GPU" else "on the $what"
+            "$what: ${pr.gpu}" + (pr.gpuLayers?.let { l ->
+                val (on, all) = l.split('/').map { it.toIntOrNull() ?: 0 }.let { it[0] to it.getOrElse(1) { 0 } }
+                if (on >= all && all > 0) " · all $all layers $where" else " · $on of $all layers $where, the rest on the CPU"
+            } ?: "") + (pr.gpuNote?.let { " · $it" } ?: "")
+        }
         pr.phase != LocalEngine.Phase.LOADING && pr.threads > 0 -> "Running on the CPU" + (pr.gpuNote?.let { " · $it" } ?: "")
         else -> null
     }
