@@ -20,6 +20,8 @@ import java.io.File
  */
 class EngineService : Service() {
     private var child: Process? = null
+    /** Bumped on every start, so the previous engine's output thread can't write into the new engine's log/exit files. */
+    @Volatile private var gen = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -38,18 +40,20 @@ class EngineService : Service() {
                     File(d, "log").writeText("Couldn't start the engine: ${e.message}\n"); File(d, "exit").writeText("-1"); stopSelf(startId); return START_NOT_STICKY
                 }
                 child = p
+                val myGen = ++gen
                 val pid = InProcessLauncher.pidOf(p).takeIf { it > 0 } ?: findEnginePid(args.firstOrNull().orEmpty(), args.portArg())
                 File(d, "pid").writeText("$pid")
                 Thread {
                     val log = File(d, "log")
                     runCatching {
                         p.inputStream.bufferedReader().forEachLine { line ->
+                            if (gen != myGen) return@forEachLine
                             log.appendText(line + "\n")
                             if (log.length() > 512 * 1024) log.writeText(log.readText().takeLast(128 * 1024)) // keep the tail
                         }
                     }
                     val code = runCatching { p.waitFor() }.getOrDefault(-1)
-                    File(d, "exit").writeText("$code")
+                    if (gen == myGen) File(d, "exit").writeText("$code")
                     if (child === p) { child = null; stopSelf() }
                 }.apply { isDaemon = true }.start()
             }

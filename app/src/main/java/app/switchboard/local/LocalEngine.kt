@@ -111,13 +111,31 @@ object LocalEngine {
     @Volatile var gpuFailures: String = ""
         private set
 
-    /** The engine's own error lines from a failed load (its log level "E", or words like failed/unsupported/out of memory). */
+    /** The engine's own error line from a failed load (its log level "E", or words like failed/unsupported/out of memory). */
     fun failureReason(e: ApiException): String {
-        val lines = (e.message.orEmpty() + "\n" + recentLog(60)).lines().map { it.trim() }.filter { it.isNotEmpty() }
-        val pick = lines.firstOrNull { Regex("^[0-9.]+ E ").containsMatchIn(it) }
-            ?: lines.firstOrNull { Regex("(?i)out of memory|failed to allocate|unsupported|not supported|abort|error|failed").containsMatchIn(it) && !it.startsWith("The local model stopped") }
-            ?: lines.first()
+        val log = recentLog(80).lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val pick = log.lastOrNull { Regex("^[0-9.]+ E ").containsMatchIn(it) }
+            ?: log.lastOrNull { Regex("(?i)out of memory|failed to allocate|unsupported|not supported|abort|error|failed|invalid").containsMatchIn(it) }
+            ?: e.message.orEmpty().lines().firstOrNull { it.isNotBlank() && !it.startsWith("The local model stopped") }
+            ?: log.lastOrNull() ?: e.message.orEmpty()
         return pick.replace(Regex("^[0-9.]+ [A-Z] "), "").take(180)
+    }
+
+    /** True while the loaded model runs (partly) on a GPU or NPU. */
+    val onAccelerator: Boolean get() = running?.gpu != null // also when the driver crash took the engine down
+
+    @Volatile private var carryNote: String? = null
+
+    /**
+     * The GPU/NPU failed while answering (e.g. Vulkan "ErrorDeviceLost"): don't use that combination for this model again this
+     * session and unload, so the next ensure() loads it on the next option (ending with the CPU).
+     */
+    suspend fun acceleratorFailed(reason: String) {
+        val k = running ?: return
+        failedCombos += "${k.path}|${k.gpu}"
+        gpuFailures += "\n[${k.gpu} failed while answering]\n$reason\n" + recentLog(30)
+        carryNote = "${k.gpu} failed while answering (${reason.take(120)}), so it switched"
+        stop()
     }
 
     /** The most telling line from the last GPU/NPU check when it found nothing (e.g. which driver library failed to load). */
@@ -328,11 +346,14 @@ object LocalEngine {
             // model are skipped for the rest of the session, and the reason is shown.
             val devs = devices()
             val gpuOnly = key.gpu?.split(',')?.filterNot { it.startsWith("HTP") }?.joinToString(",")?.ifBlank { null }
-            val otherApi = gpuOnly?.let { g -> devs.firstOrNull { !it.isNpu && it.name != g && g.split(',').none { n -> n == it.name } }?.name }
+            // On Adreno, OpenCL is the supported route and Vulkan tends to lose the device mid-reply: only use it when chosen.
+            val otherApi = gpuOnly?.takeIf { devs.none { d -> d.description.contains("Adreno", true) } }
+                ?.let { g -> devs.firstOrNull { !it.isNpu && it.name != g && g.split(',').none { n -> n == it.name } }?.name }
             // Accelerator options in order, then the CPU (null) last, which is always tried.
             val plan = (listOfNotNull(key.gpu, gpuOnly, otherApi) + listOf<String?>(null)).distinct()
                 .filter { g -> g == null || "${file.path}|$g" !in failedCombos }
-            gpuFailures = ""
+            if (carryNote == null) gpuFailures = ""
+            gpuNote = carryNote; carryNote = null
             var lastError: ApiException? = null
             for ((i, g) in plan.withIndex()) {
                 val k = key.copy(gpu = g)

@@ -100,6 +100,16 @@ class ChatClient {
         // Servers send data or keep-alive pings while a model thinks; 2.5 min of total silence means the connection is dead.
         .readTimeout(150, TimeUnit.SECONDS)
         .build()
+    /**
+     * Errors that mean the GPU/NPU (or the engine on it) failed, rather than the request: the engine dropping the connection,
+     * or the backends' own messages. Not plain request errors such as "exceeds the available context".
+     */
+    private fun acceleratorFailure(e: Exception): Boolean {
+        val m = e.message.orEmpty()
+        if (e is ApiException && e.httpCode != null && e.httpCode in 400..499) return false
+        return e !is ApiException || Regex("(?i)vk::|devicelost|vulkan|opencl|\\bCL_|ggml.?hex|hexagon|\\bhtp|decode\\(\\) failed|failed to compute|abort|ggml_assert|out of memory|failed to allocate").containsMatchIn(m)
+    }
+
     private val localHttp by lazy { http.newBuilder().readTimeout(10, TimeUnit.MINUTES).build() }
     private val json = Json { ignoreUnknownKeys = true }
     private val jsonType = "application/json".toMediaType()
@@ -114,46 +124,68 @@ class ChatClient {
         }
         checkTransport(request, opts.unrestricted)
         // A local model reading weights from storage (first reply of a big/MoE model) can be quiet for minutes.
-        val call = (if (p.local != null) localHttp else http).newCall(request)
+        val current = java.util.concurrent.atomic.AtomicReference((if (p.local != null) localHttp else http).newCall(request))
         if (p.local != null) app.switchboard.local.LocalEngine.requestStarted()
         // The blocking read runs in a child; awaitClose is registered right away, so Stop cancels the call immediately.
         launch(Dispatchers.IO) {
-            try {
-                call.execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        val err = errorText(resp)
-                        throw ApiException(if (p.local != null && "context" in err.lowercase()) "$err. Raise Context in this local model's settings, or turn tools off for this chat (tool descriptions take a few thousand tokens)." else err, resp.code)
-                    }
-                    val source = resp.body?.source() ?: throw ApiException("Empty response")
-                    val acc: TurnAccumulator = if (p.kind == ApiKind.ANTHROPIC) AnthropicAccumulator() else OpenAiAccumulator()
-                    while (true) {
-                        val line = source.readUtf8Line() ?: break
-                        if (p.local != null) app.switchboard.local.LocalEngine.touch()
-                        if (!line.startsWith("data:")) continue
-                        val data = line.removePrefix("data:").trim()
-                        if (data == "[DONE]") break
-                        val obj = runCatching { json.parseToJsonElement(data).jsonObject }.getOrNull() ?: continue
-                        if (p.local != null) (obj["prompt_progress"] as? JsonObject)?.let { pp ->
-                            val total = pp.str("total")?.toIntOrNull() ?: 0
-                            val done = (pp.str("cache")?.toIntOrNull() ?: 0) + (pp.str("processed")?.toIntOrNull() ?: 0)
-                            app.switchboard.local.LocalEngine.promptProgress(done.coerceAtMost(total), total)
+            var retries = 0
+            while (true) {
+                val call = current.get()
+                var sentAny = false
+                try {
+                    call.execute().use { resp ->
+                        if (!resp.isSuccessful) {
+                            val err = errorText(resp)
+                            throw ApiException(if (p.local != null && "context" in err.lowercase()) "$err. Raise Context in this local model's settings, or turn tools off for this chat (tool descriptions take a few thousand tokens)." else err, resp.code)
                         }
-                        val text = acc.accept(obj)
-                        val thought = acc.takeThinking()
-                        if (p.local != null && (text != null || thought != null || obj.toString().contains("\"tool_calls\""))) app.switchboard.local.LocalEngine.tokenArrived()
-                        text?.let { trySend(StreamEvent.TextDelta(it)) }
-                        thought?.let { trySend(StreamEvent.ThinkingDelta(it)) }
+                        val source = resp.body?.source() ?: throw ApiException("Empty response")
+                        val acc: TurnAccumulator = if (p.kind == ApiKind.ANTHROPIC) AnthropicAccumulator() else OpenAiAccumulator()
+                        while (true) {
+                            val line = source.readUtf8Line() ?: break
+                            if (p.local != null) app.switchboard.local.LocalEngine.touch()
+                            if (!line.startsWith("data:")) continue
+                            val data = line.removePrefix("data:").trim()
+                            if (data == "[DONE]") break
+                            val obj = runCatching { json.parseToJsonElement(data).jsonObject }.getOrNull() ?: continue
+                            // The engine reports a failure inside the stream (e.g. "decode() failed: vk::Queue::submit: ErrorDeviceLost").
+                            (obj["error"] as? JsonObject)?.let { er -> throw ApiException(er.str("message") ?: er.toString()) }
+                            if (p.local != null) (obj["prompt_progress"] as? JsonObject)?.let { pp ->
+                                val total = pp.str("total")?.toIntOrNull() ?: 0
+                                val done = (pp.str("cache")?.toIntOrNull() ?: 0) + (pp.str("processed")?.toIntOrNull() ?: 0)
+                                app.switchboard.local.LocalEngine.promptProgress(done.coerceAtMost(total), total)
+                            }
+                            val text = acc.accept(obj)
+                            val thought = acc.takeThinking()
+                            if (p.local != null && (text != null || thought != null || obj.toString().contains("\"tool_calls\""))) app.switchboard.local.LocalEngine.tokenArrived()
+                            text?.let { sentAny = true; trySend(StreamEvent.TextDelta(it)) }
+                            thought?.let { sentAny = true; trySend(StreamEvent.ThinkingDelta(it)) }
+                        }
+                        trySend(acc.finish())
                     }
-                    trySend(acc.finish())
+                    close()
+                    return@launch
+                } catch (e: Exception) {
+                    if (call.isCanceled()) { close(); return@launch }
+                    // The GPU/NPU failed before any of the reply arrived (driver reset, unsupported operation, engine crash):
+                    // load the model on the next option and answer again, instead of failing the message.
+                    if (p.local != null && !sentAny && retries < 3 && app.switchboard.local.LocalEngine.onAccelerator && acceleratorFailure(e)) {
+                        retries++
+                        try {
+                            app.switchboard.local.LocalEngine.acceleratorFailed(e.message ?: e.javaClass.simpleName)
+                            app.switchboard.local.LocalEngine.ensure(p)
+                        } catch (e2: Exception) { close(e2); return@launch }
+                        app.switchboard.local.LocalEngine.requestStarted()
+                        current.set(localHttp.newCall(request))
+                        continue
+                    }
+                    // A local engine that died mid-reply (e.g. stopped by Android for memory): say that instead of "connection reset".
+                    val why = if (p.local != null) app.switchboard.local.LocalEngine.whyStopped() else null
+                    close(why?.let { ApiException(it) } ?: e)
+                    return@launch
                 }
-                close()
-            } catch (e: Exception) {
-                // A local engine that died mid-reply (e.g. stopped by Android for memory): say that instead of "connection reset".
-                val why = if (p.local != null) app.switchboard.local.LocalEngine.whyStopped() else null
-                close(if (call.isCanceled()) null else why?.let { ApiException(it) } ?: e)
             }
         }
-        awaitClose { call.cancel(); if (p.local != null) app.switchboard.local.LocalEngine.requestEnded() }
+        awaitClose { current.get().cancel(); if (p.local != null) app.switchboard.local.LocalEngine.requestEnded() }
     }.flowOn(Dispatchers.IO)
 
     suspend fun listModels(p: Provider, unrestricted: Boolean = false): List<String> = listModelsDetailed(p, unrestricted).map { it.id }

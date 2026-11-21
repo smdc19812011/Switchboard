@@ -11,6 +11,7 @@ import app.switchboard.net.StreamEvent
 import app.switchboard.ui.localStatusLines
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.launch
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -107,6 +108,22 @@ class LocalGpuTest {
             assertTrue(reply.last() is StreamEvent.TurnEnd)
             val gpu = LocalEngine.progress.value!!
             assertTrue("$gpu", gpu.gpu!!.endsWith("(Vulkan)") && gpu.gpuLayers!!.matches(Regex("\\d+/\\d+")))
+
+            // The GPU fails while answering (as Vulkan's "ErrorDeviceLost" did on the phone, taking the engine down): the same
+            // message is answered again on the next option (here the CPU), and the status says why.
+            val long = (1..300).joinToString(" ") { "word$it" }
+            val pid = File(LocalEngine.stateDir, "llama-server.pid").readText().trim()
+            val killer = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                while (LocalEngine.progress.value?.phase != LocalEngine.Phase.READING) kotlinx.coroutines.delay(2)
+                ProcessBuilder("kill", "-9", pid).start().waitFor()
+            }
+            val again = ChatClient().stream(p, listOf(ChatMessage(role = Role.USER, text = long)), RequestOptions(maxTokens = 4)).toList()
+            killer.cancel()
+            assertTrue("$again", again.last() is StreamEvent.TurnEnd)
+            val after = LocalEngine.progress.value!!
+            assertNull("${after} // failures=${LocalEngine.gpuFailures} // killed=${killer.isCompleted} // events=${again.size}", after.gpu)
+            assertTrue("${after.gpuNote}", after.gpuNote!!.contains("failed while answering"))
+            LocalEngine.stop()
 
             val cpu = p.copy(local = p.local!!.copy(processor = "cpu"))
             ChatClient().stream(cpu, listOf(ChatMessage(role = Role.USER, text = "Hi")), RequestOptions(maxTokens = 4)).toList()
