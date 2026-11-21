@@ -239,6 +239,23 @@ fun LocalModelDialog(vm: ChatViewModel, initial: Provider, isNew: Boolean, onDis
                 else -> "Shares the model between ${chosen.joinToString(" + ") { (if (it.isNpu) "NPU " else "GPU ") + it.description + " (" + it.api + ")" }} and the CPU: " +
                     "as many layers as fit go on the ${if (chosen.size > 1) "NPU and GPU" else if (chosen[0].isNpu) "NPU" else "GPU"}, the rest run on the CPU. If they can't run a model, it falls back by itself."
             }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // What the engine itself reports, for when a GPU/NPU isn't found.
+            var probe by remember { mutableStateOf<String?>(null) }
+            val probeScope = rememberCoroutineScope()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = {
+                    probe = "Checking… (the first check can take up to a minute while the GPU compiles its programs)"
+                    probeScope.launch { devices = LocalEngine.devices(force = true); probe = LocalEngine.lastProbe }
+                }) { Text("Check GPU/NPU") }
+                if (probe != null && !probe!!.startsWith("Checking")) TextButton(onClick = {
+                    val cm = vm.getApplication<android.app.Application>().getSystemService(android.content.ClipboardManager::class.java)
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("GPU/NPU check", probe))
+                }) { Text("Copy") }
+            }
+            probe?.let {
+                Text(it.lines().filter { l -> l.isNotBlank() }.takeLast(25).joinToString("\n"), style = MaterialTheme.typography.labelSmall,
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             if (chosen.isNotEmpty()) Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 OutlinedTextField(gpuLayers, { gpuLayers = it.filter(Char::isDigit).take(3) }, label = { Text("GPU layers") }, placeholder = { Text("Auto") },
                     singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.weight(1f),

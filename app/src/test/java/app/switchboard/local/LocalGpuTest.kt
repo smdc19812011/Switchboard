@@ -42,6 +42,9 @@ class LocalGpuTest {
         """.trimIndent()
         assertEquals("llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan)" to "2/3", LocalEngine.placementFromLog(log))
         assertEquals(null to null, LocalEngine.placementFromLog("nothing here"))
+        // A real model's loading log is hundreds of lines long; the device line near the top must still be found.
+        val longLog = log.lines().first() + "\n" + (1..1500).joinToString("\n") { "0.01.000 I llama_model_loader: - kv $it: some.key = value" } + "\n" + log.lines().last()
+        assertEquals("llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan)" to "2/3", LocalEngine.placementFromLog(longLog))
         val gb = 1L shl 30
         val split = localStatusLines(LocalEngine.Progress(LocalEngine.Phase.IDLE, "m", 4 * gb, 4 * gb, gpu = "Adreno 650 (OpenCL)", gpuLayers = "28/36"))
         assertTrue(split.second!!, split.second!!.contains("GPU: Adreno 650 (OpenCL) · 28 of 36 layers on the GPU, the rest on the CPU"))

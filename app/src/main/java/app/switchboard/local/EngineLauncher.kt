@@ -28,7 +28,7 @@ object InProcessLauncher : EngineLauncher {
         pb.environment().putAll(env)
         val p = pb.start()
         val log = ArrayDeque<String>()
-        Thread { p.inputStream.bufferedReader().forEachLine { line -> synchronized(log) { log.addLast(line); while (log.size > 300) log.removeFirst() } } }
+        Thread { p.inputStream.bufferedReader().forEachLine { line -> synchronized(log) { log.addLast(line); while (log.size > 5000) log.removeFirst() } } }
             .apply { isDaemon = true }.start()
         return object : EngineHandle {
             override val pid = pidOf(p)

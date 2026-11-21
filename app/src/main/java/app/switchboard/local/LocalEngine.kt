@@ -61,18 +61,29 @@ object LocalEngine {
     }
 
     /** The GPUs this phone exposes to the engine (asked once, then remembered). */
-    suspend fun devices(): List<GpuDevice> = withContext(Dispatchers.IO) {
+    suspend fun devices(force: Boolean = false): List<GpuDevice> = withContext(Dispatchers.IO) {
         val bin = binary ?: return@withContext emptyList()
-        deviceCache?.takeIf { it.first == bin.path }?.let { return@withContext it.second }
-        runCatching {
+        if (!force) deviceCache?.takeIf { it.first == bin.path }?.let { return@withContext it.second }
+        val found = runCatching {
             val pb = ProcessBuilder(bin.path, "--list-devices").redirectErrorStream(true)
             pb.environment().putAll(engineEnv(bin))
             val p = pb.start()
             val out = p.inputStream.bufferedReader().readText()
-            if (!p.waitFor(30, TimeUnit.SECONDS)) p.destroyForcibly()
+            val exited = p.waitFor(60, TimeUnit.SECONDS)
+            if (!exited) p.destroyForcibly()
+            lastProbe = "exit ${if (exited) p.exitValue() else "timeout"}\n" + out.trim().takeLast(6000)
             parseDevices(out)
-        }.getOrDefault(emptyList()).also { deviceCache = bin.path to it }
+        }.getOrElse { lastProbe = "couldn't run the check: ${it.message}"; emptyList() }
+        // Only a successful answer is remembered: an empty one is asked again next time.
+        if (found.isNotEmpty()) deviceCache = bin.path to found
+        found
     }
+
+    @Volatile private var cpuOnlyByChoice: Boolean? = null
+
+    /** What the last GPU/NPU check printed (for the "Check GPU/NPU" details). */
+    @Volatile var lastProbe: String = ""
+        private set
 
     /** The one GPU to use (the same GPU often appears through both OpenCL and Vulkan; using both would split it in two). */
     fun pickDevice(devices: List<GpuDevice>, backend: String): GpuDevice? {
@@ -235,6 +246,7 @@ object LocalEngine {
         if (File(lm.path + ".part").exists() && !file.exists()) throw ApiException("${p.name}: the model is still downloading.")
         if (!file.canRead()) throw ApiException("${p.name}: can't read ${lm.path}. Choose the file again (or allow All files access).")
         val device = pickDevices(devices(), lm.processor, lm.gpuBackend).joinToString(",") { it.name }.ifBlank { null }
+        cpuOnlyByChoice = lm.processor == "cpu"
         val key = Key(file.path, lm.contextSize.coerceIn(512, 262_144), lm.threads, p.apiKey, lm.largeMode, device, lm.gpuLayers)
         keepMs = lm.keepMinutes.coerceAtLeast(1) * 60_000L
         touch()
@@ -309,8 +321,9 @@ object LocalEngine {
             delay(300)
         }
         _status.value = name
-        val (gpuName, offloaded) = placementFromLog(p.log(200))
-        _progress.value = _progress.value?.copy(phase = Phase.IDLE, gpu = if (key.gpu == null) null else gpuName, gpuLayers = if (key.gpu == null) null else offloaded, gpuNote = gpuNote)
+        val (gpuName, offloaded) = placementFromLog(p.log(5000)) // the whole loading log: big models print hundreds of lines
+        _progress.value = _progress.value?.copy(phase = Phase.IDLE, gpu = if (key.gpu == null) null else gpuName ?: key.gpu, gpuLayers = if (key.gpu == null) null else offloaded,
+            gpuNote = gpuNote ?: if (key.gpu == null && cpuOnlyByChoice != true) "no GPU or NPU was detected (see Check GPU/NPU in the model's settings)" else null)
         startIdleWatch()
     }
 
