@@ -111,14 +111,23 @@ object LocalEngine {
     @Volatile var gpuFailures: String = ""
         private set
 
-    /** The engine's own error line from a failed load (its log level "E", or words like failed/unsupported/out of memory). */
-    fun failureReason(e: ApiException): String {
-        val log = recentLog(80).lines().map { it.trim() }.filter { it.isNotEmpty() }
-        val pick = log.lastOrNull { Regex("^[0-9.]+ E ").containsMatchIn(it) }
-            ?: log.lastOrNull { Regex("(?i)out of memory|failed to allocate|unsupported|not supported|abort|error|failed|invalid").containsMatchIn(it) }
-            ?: e.message.orEmpty().lines().firstOrNull { it.isNotBlank() && !it.startsWith("The local model stopped") }
-            ?: log.lastOrNull() ?: e.message.orEmpty()
-        return pick.replace(Regex("^[0-9.]+ [A-Z] "), "").take(180)
+    /** Generic follow-up lines llama.cpp prints after the real error; skipped when picking the reason. */
+    private val genericError = Regex("(?i)exiting due to|failed to create context|common_init|load_model: failed to load model|cleaning up|failed to load model '|srv\\s+load_model")
+
+    /**
+     * The real cause from a failed load: llama.cpp's "error loading model: …" line, else its first specific error (log level
+     * "E") or a line saying failed/unsupported/out of memory, skipping the generic "exiting due to model loading error".
+     */
+    fun failureReason(e: ApiException): String = reasonFromLog(recentLog(200)) ?: e.message.orEmpty().lines()
+        .firstOrNull { it.isNotBlank() && !it.startsWith("The local model stopped") } ?: e.message.orEmpty()
+
+    fun reasonFromLog(log: String): String? {
+        val lines = log.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        fun clean(l: String) = l.replace(Regex("^[0-9.]+ [A-Z] "), "").replace(Regex("\\s+"), " ").take(220)
+        lines.firstOrNull { "error loading model" in it.lowercase() }?.let { return clean(it) }
+        val errs = lines.filter { Regex("^[0-9.]+ E ").containsMatchIn(it) && !genericError.containsMatchIn(it) }
+        if (errs.isNotEmpty()) return errs.take(2).map(::clean).distinct().joinToString(" / ")
+        return lines.firstOrNull { Regex("(?i)out of memory|failed to allocate|unsupported|not supported|abort|invalid|error|failed").containsMatchIn(it) && !genericError.containsMatchIn(it) }?.let(::clean)
     }
 
     /** True while the loaded model runs (partly) on a GPU or NPU. */

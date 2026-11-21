@@ -53,6 +53,22 @@ class LocalGpuTest {
         assertTrue(all.second!!.contains("all 36 layers on the GPU"))
     }
 
+    /** The real cause is picked from a failed load, not llama.cpp's generic follow-up lines. */
+    @Test fun failureReasonFindsTheCause() {
+        val log = """
+            0.01.100 I load_tensors: offloading 32 repeating layers to GPU
+            0.01.200 E llama_model_load: error loading model: unable to allocate GPUOpenCL buffer
+            0.01.201 E llama_model_load_from_file_impl: failed to load model
+            0.01.202 E common_init_: failed to load model 'model.gguf'
+            0.01.203 E srv    load_model: failed to load model, 'model.gguf'
+            0.01.204 E srv  server_run_i: exiting due to model loading error
+        """.trimIndent()
+        assertEquals("llama_model_load: error loading model: unable to allocate GPUOpenCL buffer", LocalEngine.reasonFromLog(log))
+        val unsupported = "0.1 I x\n0.2 E ggml_opencl: unsupported op GATED_DELTA_NET\n0.3 E srv  server_run_i: exiting due to model loading error"
+        assertEquals("ggml_opencl: unsupported op GATED_DELTA_NET", LocalEngine.reasonFromLog(unsupported))
+        assertEquals(null, LocalEngine.reasonFromLog("0.1 I all good"))
+    }
+
     /** A Snapdragon 8 Elite-class phone: NPU (Hexagon HTP) plus the Adreno GPU seen through OpenCL and Vulkan. */
     @Test fun npuGpuAndCpu() {
         val devs = LocalEngine.parseDevices("""

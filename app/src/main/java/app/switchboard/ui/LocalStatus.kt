@@ -79,6 +79,15 @@ fun LocalProgressBar(pr: LocalEngine.Progress, modifier: Modifier = Modifier) {
             if (pr.phase != LocalEngine.Phase.LOADING) LinearProgressIndicator(progress = { pr.memoryFraction.toFloat() }, modifier = Modifier.fillMaxWidth().height(2.dp),
                 color = MaterialTheme.colorScheme.tertiary, trackColor = MaterialTheme.colorScheme.surfaceVariant)
             Row { Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp)) }
+            // After a GPU/NPU fallback: copy the engine's logs of the failed attempts (to share, e.g. for a bug report).
+            if (pr.gpuNote != null && LocalEngine.gpuFailures.isNotBlank()) {
+                val ctx = androidx.compose.ui.platform.LocalContext.current
+                androidx.compose.material3.TextButton(onClick = {
+                    ctx.getSystemService(android.content.ClipboardManager::class.java)
+                        .setPrimaryClip(android.content.ClipData.newPlainText("GPU/NPU log", LocalEngine.lastProbe + "\n\nFailed GPU/NPU attempts:" + LocalEngine.gpuFailures))
+                    android.widget.Toast.makeText(ctx, "GPU/NPU log copied", android.widget.Toast.LENGTH_SHORT).show()
+                }, contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)) { Text("Copy GPU/NPU log", style = MaterialTheme.typography.labelMedium) }
+            }
         }
     }
 }
